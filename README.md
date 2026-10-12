@@ -1,6 +1,6 @@
 # pm-dispatch
 
-一个 Agent Skills 格式的技能：让**主会话担任项目经理**，把简单但耗时的机械任务写成自包含任务卡，成批并行派发给轻量执行模型（flash 档），结果落盘后由主会话验收、打回和统合。可在 Qoder CLI、ZCode、Codex 等支持 `SKILL.md` 的客户端里使用。
+一个 Agent Skills 格式的技能：让**主会话担任项目经理**，把简单但耗时的机械任务写成自包含任务卡，按依赖图流水线式并行派发给轻量执行模型（flash 档；子代理、无头 CLI 或手动粘贴均可），结果落盘后由主会话按风险分级验收、打回和统合。可在 Qoder CLI、ZCode、Codex、Claude Code 等支持 `SKILL.md` 的客户端里使用。
 
 An Agent-Skills-format skill that turns the main session into a project manager: it writes self-contained task cards for cheap/fast execution models to run in parallel, then reviews, rejects, and integrates their output. Works in any client that loads `SKILL.md` skills.
 
@@ -20,12 +20,12 @@ An Agent-Skills-format skill that turns the main session into a project manager:
 | 一个 agent 把同工作树里另一个 agent 的未提交改动回滚掉 | 卡片硬安全边界明写"禁止回滚不属于本卡的改动" |
 | GUI 验收被权限分类器拦住，一卡白跑 | 「权限现实」：卡片写清前置命令，拦住不重试，改成用户起实例 / PM 只跑套件 |
 | 用户变成两个 agent 之间的人肉翻译层 | 卡片写明「不要提问，卡片没覆盖的记 BLOCKED 后停止」 |
+| 用户人肉搬运启动语、按批次干等最慢的那张卡 | `scripts/dispatch.cjs` 按依赖图算"现在能派谁"，支持子代理 / 无头 CLI 直接拉起 |
+| 每张卡都做全套验收，PM 成了瓶颈 | 卡头声明验收等级 L1/L2/L3，强度随风险走 |
 
 **分工原则**：判断留在主会话（架构、术语、验收标准、不可逆操作），执行外派出去（批量改写、数据收集、补测试、逐文件迁移）。
 
 ## 安装
-
-把 `pm-dispatch/` 整个目录放进 Qoder 的技能目录：
 
 把 `pm-dispatch/` 整个目录拷进任一技能根（格式是同一套 Agent Skills 规范：`SKILL.md` + `scripts/` + `references/` + `assets/`，`name` 等于目录名）：
 
@@ -35,18 +35,35 @@ An Agent-Skills-format skill that turns the main session into a project manager:
 | Qoder CLI | `~/.qoder-cn/skills/` | `<project>/.qoder/skills/` |
 | ZCode | `~/.zcode/skills/` | `<project>/.zcode/skills/` |
 | Codex | `~/.codex/skills/` | — |
+| Claude Code | `~/.claude/skills/` | `<project>/.claude/skills/` |
 
 Windows 上 `~` 即 `C:\Users\<你的用户名>`。装完重启会话或 `/skills reload`，用 `/pm-dispatch <功能名>` 调用。
 
 同一份内容在多个根里同时存在会被重复发现，挑一个根装即可（默认建议 `~/.agents/skills/`）。
 
+## 配置执行子代理（推荐，一次性）
+
+主会话用大模型当 PM、执行交给 flash 档模型，靠的是在 harness 里装一个**把 model 钉死在 flash 上**的自定义子代理 `pm-executor`。装好之后派卡不再需要开会话、复制启动语：
+
+| Harness | 模板 | 放到 | 派卡时点名 |
+|---|---|---|---|
+| Qoder | `pm-dispatch/assets/executors/qoder/pm-executor.md` | `.qoder/agents/` 或 `~/.qoder/agents/`（CN 版 `~/.qoder-cn/agents/`） | `pm-executor` |
+| ZCode | `pm-dispatch/assets/executors/zcode/pm-executor.md` | `~/.zcode/agents/` | `pm-executor` |
+| Codex | `pm-dispatch/assets/executors/codex/pm-executor.toml` | `~/.codex/agents/` 或 `.codex/agents/` | `pm_executor` |
+
+1. 把模板里的 `REPLACE_WITH_FLASH_MODEL` 换成你账号里 flash 档的模型（不换会直接报错，防止悄悄用上大模型）。
+2. 新开会话（Qoder 可 `/agents reload`）。
+3. 用一张只读 T 卡试跑 `dispatch.cjs next <目录> --agent pm-executor`，在用量统计里确认子代理跑的确实是 flash。
+
+安装细节、首次验证和已知坑（例如 `codex exec` 无头模式下会忽略子代理钉的模型）见 `pm-dispatch/references/executors.md`。
+
 ## 跨客户端
 
-不依赖任何单一客户端的专有能力——没用到子代理、没用到 MCP，全流程只是文件读写加一条 Node 命令。任务卡的交接契约也只是"卡片文件 + 结果文件 + 一段可粘贴启动语"，所以主会话和执行方可以是**不同客户端**：Qoder 当 PM、ZCode 里的轻量模型执行，反过来也行。
+不依赖任何单一客户端的专有能力——没用到 MCP，全流程只是文件读写加 Node 命令。客户端有子代理或无头 CLI 时会用来提速，没有就退回手动粘贴启动语。任务卡的交接契约也只是"卡片文件 + 结果文件 + 一段可粘贴启动语"，所以主会话和执行方可以是**不同客户端**：Qoder 当 PM、ZCode 里的轻量模型执行，反过来也行。
 
 唯一外部依赖是本机有 Node（跑 `scripts/check-cards.cjs`）。frontmatter 只保留 `name` 和 `description` 两个字段，以兼容各家对保留字段的规范差异。
 
-技能根的定位写在 SKILL.md 的门禁命令里，按 `~/.agents` → `~/.qoder-cn` → `~/.zcode` → `~/.codex` 顺序探测，不写死单一安装目录。
+技能根的定位写在 SKILL.md 开头，按 `~/.agents` → `~/.qoder-cn` → `~/.zcode` → `~/.codex` → `~/.claude` → 项目级目录顺序探测，不写死单一安装目录。
 
 ## 触发方式
 
@@ -60,17 +77,38 @@ Windows 上 `~` 即 `C:\Users\<你的用户名>`。装完重启会话或 `/skill
 
 ```
 .dispatch/登录功能/
-├── ledger.md              PM 台账，唯一进度事实源（只有主会话写）
+├── ledger.md              PM 台账，唯一进度事实源（只有主会话写；调度器读它的表格）
 ├── cards/T01-schema.md     任务卡（只有主会话写，执行 agent 禁改）
+├── prompts/T01.txt         启动语（dispatch.cjs 生成）
 ├── results/T01.md          执行结果（只有对应执行 agent 写）
 └── work/T01/               该卡唯一可写区
 ```
 
-派发时主会话给每张卡输出一段可直接复制的启动语，指向卡片的绝对路径；你把这段贴进执行模型的会话即可，多张卡并行。
+## 调度（新）
+
+```
+$ node "$S/scripts/dispatch.cjs" status "/home/me/proj/.dispatch/demo"
+卡片 4 张 | 并发上限 2 | ledger 已读
+  A02   待派      依赖 T01
+  A03   待派      依赖 T01
+  B04   待派      依赖 A02,A03  等 A02,A03
+  T01   放行      依赖 无
+
+现在可派: A02
+  暂缓 A03：与同轮的 A02 冲突：独占资源 gui
+```
+
+- `status`：谁能派、谁在等、为什么暂缓（前置未放行 / 抢独占资源 / 写同一路径 / 并发满）。
+- `next`：给可派的卡生成 `prompts/卡号.txt` 启动语——贴给执行会话，或作为子代理任务原样发出。
+- `next --agent pm-executor`：直接打印一整段派发指令（点名子代理、每张卡一个、并行启动），PM 原样交给自己的子代理工具。
+- `run --exec "命令模板"`：用本机的无头 agent CLI 并行拉起，模板里 `%PROMPT_FILE%` `%CARD%` `%RESULT%` `%WORK%`
+  会替换成带引号的绝对路径；单卡超时、日志落 `work/卡号/_exec.log`、执行器结束后核对结果文件是否存在。
+
+不再按"批次"一刀切：任何一张卡放行，被它解锁的卡立刻可派，被依赖越多的卡越先派。
 
 ## 卡片门禁
 
-`scripts/check-cards.cjs` 检查：占位符残留、必需小节缺失、`Blocked by` 缺失、写入与回传路径未用绝对路径、命令里出现 git 写操作 / 按名字杀进程 / 安装依赖 / 管道执行远程脚本。
+`scripts/check-cards.cjs` 检查：占位符残留（含中文"待填"、未删的 PM 注释）、必需小节缺失、`Blocked by` 缺失或引用不存在的卡、依赖成环、写入白名单重叠、验收条目不可勾选、写入与回传路径未用绝对路径（Windows / POSIX 都认）、命令里出现 git 写操作 / 按名字杀进程 / 装依赖 / 管道执行远程脚本。
 
 ```
 $ S="$(ls -d "$HOME/.agents/skills/pm-dispatch" "$HOME/.qoder-cn/skills/pm-dispatch" "$HOME/.zcode/skills/pm-dispatch" "$HOME/.codex/skills/pm-dispatch" 2>/dev/null | head -1)"
@@ -88,7 +126,7 @@ $ node "$S/scripts/check-cards.cjs" "<项目绝对路径>\.dispatch\demo\cards"
     ERROR L20  卡片命令含 git 写操作，执行 agent 只允许只读 git :: git commit -am "done"
     …还有 5 条
     => 12 error, 1 warn
-汇总: 2 张卡, 1 张需修, 12 error, 1 warn
+汇总: 2 张卡, 1 处需修, 12 error, 1 warn
 结论: 修卡后再派发
 ```
 
@@ -96,9 +134,9 @@ $ node "$S/scripts/check-cards.cjs" "<项目绝对路径>\.dispatch\demo\cards"
 
 加 `--warn-as-error` 可让相对路径告警也拦下派发。退出码：0 可派发 / 1 需修卡 / 2 用法或路径错误。
 
-## 验收工具（两个新脚本）
+## 验收工具
 
-技能原本只有"派发前"的门禁，缺"回传后"的手段。这两个把 PM 验收里最容易被糊弄的两步变成可跑的命令。
+把 PM 验收里最容易被糊弄的两步变成可跑的命令。验收强度按卡头等级走：L1 只重跑与抽查，L2 加这两个脚本，L3 加多点变异与现场二次重跑。
 
 **1. 回归没有变松** —— 旧版本里每条断言/测试标题，逐条到当前版本里找：
 
@@ -110,12 +148,13 @@ $ node "$S/scripts/audit-assertions.cjs" "D:/proj" "scripts/verify-x.mjs,src/a.t
     - 五档来自腾讯（与快照是同一条接口的两段）
   新增: 3 条
     + 五档源符合本轮可用性（非首选源必须有失败记录解释）
-汇总: 2 个文件, 消失标题 1 条
-结论: 有标题消失，逐条对应对后才能放行
+RESULT files=2 problems=1
+结论: 有消失/减少/跳过，逐条对应后才能放行
 ```
 
-`--preset check` 适配自定义 `r.check("标题", …)`，`--preset test` 适配 jest/vitest/node:test，
-自家形状用 `--pattern='…(捕获组1是标题)…'`。退出码：0 无标题消失 / 1 有消失 / 2 用法错。
+`--preset check` 适配自定义 `r.check("标题", …)`，`--preset test` 适配 jest/vitest/mocha/node:test，另有 `pytest`、`go`，
+自家形状用 `--pattern='…(捕获组1是标题)…'`。除了标题消失，还会抓**同名断言次数变少**、**新加 .skip/xit**、**新出现 .only**。
+退出码：0 没变松 / 1 有问题 / 2 用法错。
 
 **2. 断言不是恒真** —— 表驱动的变异抽查，在备份保护下把代码逐点改坏：
 
@@ -128,7 +167,7 @@ $ node "$S/scripts/audit-assertions.cjs" "D:/proj" "scripts/verify-x.mjs,src/a.t
   ] }
 ```
 ```
-$ node "$S/scripts/mutate-check.cjs" --plan "D:/proj/temp/mutate-plan.json" --baseline
+$ node "$S/scripts/mutate-check.cjs" --plan "D:/proj/temp/mutate-plan.json"
 用例 2 个、涉及文件 2 个 → 备份在 D:\proj\temp\mutate-check-20261012T073938
 基线（未变异）:
   node tests/unit.mjs  → rc=0 RESULT pass=4 fail=0
@@ -136,12 +175,15 @@ M1  杀掉（断言有效）  rc=1 RESULT pass=3 fail=1
      ↳ FAIL 北交所 920185 给 30 :: got 10 want 30
 M2  没杀掉（恒真/覆盖不足）  rc=0 RESULT pass=4 fail=0
 还原校验：2 个文件逐字节一致
-结论: 1 个变异没被杀掉（其中锚点无效 0 个）—— 补断言、修锚点，或打回
+
+RESULT cases=2 killed=1 survived=1 wrong_kill=0 skipped=0
+结论: 1 个没有有效杀掉（存活 1、红错地方 0、锚点/命令无效 0）—— 补断言、修锚点，或打回
 ```
 
-要点：一次只改一个点；`from` 必须唯一命中（不唯一直接 SKIP 并计为未验证）；
-结束自动还原并逐字节校验，所以**未跟踪的新文件也不会丢**（不靠 `git checkout`）。
-`--keep-backup` 保留备份目录。退出码：0 全杀掉 / 1 有漏网或锚点无效 / 2 用法或还原失败。
+要点：一次只改一个点；`from` 必须唯一命中（不唯一直接 SKIP 并计为未验证）；基线默认先跑，不绿直接中止；
+`expect` 钉住应该红的那条断言；变异导致崩溃（语法错、未定义）不算有效杀掉；死循环按超时杀掉；
+按原始字节备份与还原（BOM、CRLF、非 UTF-8 都安全），Ctrl+C 也会先还原；命令支持带引号的含空格路径。
+`--only M1,M3` 只跑部分，`--keep-backup` 保留备份。退出码：0 全杀掉 / 1 有漏网、红错地方或锚点无效 / 2 用法错、基线不绿或还原失败。
 
 ## 在构建链中的位置
 
@@ -156,15 +198,39 @@ grill-with-docs → to-spec → to-tickets ─┬─ 判断类 → implement →
 
 ```
 pm-dispatch/
-├── SKILL.md                        角色边界、分诊表、卡型、写卡→排批→验收→统合→基线→台账
-├── assets/card-template.md         十节任务卡模板：批次互斥声明、红→绿对照、状态词表、RESULT 机器行、打回 §10 的结构
-├── references/acceptance.md        验收手法手册：三查具体化、机械核对/变异抽查、现场红的五类分法、打回卡怎么写
-├── references/known-pitfalls.md    踩坑库（Shell/Node/权限/进程/断言与判据/取证卡写法/同工作树多卡/Git/目录卫生/弱模型特征）
+├── SKILL.md                        角色边界、分诊、卡型、写卡→流水线派发→分级验收→统合→台账
+├── assets/card-template.md         十节任务卡模板：机读卡头（卡型/Blocked by/独占资源/验收等级）、红→绿对照、RESULT 机器行、打回 §10
+├── references/acceptance.md        验收手册：L1/L2/L3 分级、机械核对/变异抽查、现场红五类分法、打回卡怎么写
+├── references/discipline.md        跨批次纪律：基线与行号漂移、权限现实、执行者纠正 PM、卡片粒度
+├── references/executors.md         执行子代理：Qoder / ZCode / Codex 里把 pm-executor 钉在 flash 模型上，安装、首次验证、已知坑
+├── assets/executors/               三个 harness 的 pm-executor 模板 + 共用系统提示词
+├── references/known-pitfalls.md    踩坑库（Shell/Node/权限/进程/断言与判据/无头执行器/同工作树多卡/Git/弱模型特征）
 └── scripts/
-    ├── check-cards.cjs             派发前静态门禁：占位符、缺小节、越界命令、非绝对路径
-    ├── audit-assertions.cjs        回传后核对：旧版每条断言标题是否还在（回归有没有变松）
-    └── mutate-check.cjs            回传后核对：把代码改坏看点不红（断言是不是恒真）
+    ├── lib/card.cjs                卡片解析公共部分（代码块感知的小节切分、卡头字段、白名单路径）
+    ├── check-cards.cjs             派发前门禁：占位符、缺小节、越界命令、绝对路径、依赖环、白名单重叠
+    ├── dispatch.cjs                调度：status / next（启动语 / --agent 子代理派发指令）/ run（并行拉起无头执行器）
+    ├── audit-assertions.cjs        回传后核对：断言标题消失、次数变少、新增 skip/only
+    └── mutate-check.cjs            回传后核对：把代码改坏看会不会红（断言是不是恒真）
+
+tests/selftest.cjs                  脚本与子代理模板的自测（node tests/selftest.cjs，37 项）
 ```
+
+## 变更（v3，提速 + 修门禁）
+
+**提速**
+- **流水线派发**：新增 `scripts/dispatch.cjs`，按依赖图 + 独占资源 + 写入白名单算"现在能派谁"，取代"整批放行才派下一批"。
+- **去掉人肉搬运**：Qoder / ZCode / Codex 各配一个钉死 flash 模型的 `pm-executor` 子代理（`assets/executors/`），主会话跑 `dispatch.cjs next --agent pm-executor` 直接并行派发；也可走无头 CLI（`dispatch.cjs run`），都不行才退回手动粘贴。
+- **分级验收**：卡头声明 L1/L2/L3，T 卡不再被要求做变异抽查，B 卡则必须钉住具体断言。
+- **SKILL.md 瘦身**：基线纪律、权限现实、执行者纠正 PM 移到 `references/discipline.md`，每次加载少读约 40%。
+
+**修 bug**
+- check-cards：模板 §9 代码块里的 `#`/`##` 标题会截断「回传契约」小节，导致**模板本身永远过不了门禁**；已改为代码块感知。
+- check-cards：绝对路径只认 Windows 盘符，macOS/Linux 上的卡全部误报；现在认盘符、UNC、POSIX。
+- check-cards：`\b待填\b` 对中文永远不命中；`<file>` 被当作合法标签放行。均已修。
+- mutate-check：命令按空格切分，路径带空格就跑错；无超时，变异成死循环会永远挂住；Ctrl+C 会把改坏的代码留在仓库里；
+  "逐字节校验"实际是字符串比较；`to` 里的 `$&` 被当成替换模式；基线不绿仍继续跑。均已修。
+- audit-assertions：对照版本里不存在的新文件直接报错退出；同名断言删掉几处查不出；`.skip` 绕过查不出。均已修。
+- 新增 `tests/selftest.cjs` 覆盖以上每一条。
 
 ## 变更（v2，来自一轮真实派发）
 
