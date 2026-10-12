@@ -89,6 +89,25 @@ check('next --agent：派发指令点名子代理并行启动', r.rc === 0 && r.
 r = run('dispatch.cjs', ['next', D, '--agent', 'bad name;rm']);
 check('next --agent：非法子代理名在动手前就拒绝', r.rc === 2 && r.out.includes('子代理名只能含') && !r.out.includes('已写入'), r.out);
 
+// 派发开关：ledger 写"派发方式 手动"后，--agent 与 run 在动手前就被拒
+const ledgerTxt = fs.readFileSync(path.join(D, 'ledger.md'), 'utf8');
+fs.writeFileSync(path.join(D, 'ledger.md'), ledgerTxt.replace('并发上限 2', '并发上限 2 | 派发方式 手动'));
+fs.rmSync(path.join(D, 'prompts'), { recursive: true, force: true });
+r = run('dispatch.cjs', ['status', D]);
+check('派发开关：status 显示派发方式 手动', r.rc === 0 && r.out.includes('派发方式 手动'), r.out);
+r = run('dispatch.cjs', ['next', D, '--agent', 'pm-executor']);
+check('派发开关：手动时拒绝 next --agent，且不写 prompts', r.rc === 2 && r.out.includes('派发方式 手动') && !fs.existsSync(path.join(D, 'prompts')), r.out);
+r = run('dispatch.cjs', ['run', D, '--exec', 'echo x']);
+check('派发开关：手动时拒绝 run', r.rc === 2 && r.out.includes('不允许 run'), r.out);
+r = run('dispatch.cjs', ['next', D]);
+check('派发开关：手动时 next 照常打印启动语', r.rc === 0 && r.out.includes('不要向用户提问'), r.out);
+fs.writeFileSync(path.join(D, 'ledger.md'), ledgerTxt.replace('并发上限 2', '并发上限 2 | 派发方式 子代理'));
+r = run('dispatch.cjs', ['run', D, '--exec', 'echo x']);
+check('派发开关：子代理时拒绝 run', r.rc === 2 && r.out.includes('next --agent'), r.out);
+r = run('dispatch.cjs', ['next', D, '--agent', 'pm-executor']);
+check('派发开关：子代理时 next --agent 照常', r.rc === 0 && r.out.includes('pm-executor 子代理'), r.out);
+fs.writeFileSync(path.join(D, 'ledger.md'), ledgerTxt);
+
 // ---------- 执行子代理模板 ----------
 const EX = path.join(SKILL, 'assets', 'executors');
 const exPrompt = fs.readFileSync(path.join(EX, 'executor-prompt.md'), 'utf8').trim();
