@@ -8,6 +8,19 @@
 执行者的结果文件只用来做两件事：**定位要重跑什么**、**看他声称的事实是否可复核**。
 凡是"我跑了 X，输出是 Y"，一律自己再跑一遍。判定只认自己看到的输出与退出码。
 
+## 0. 验收等级：强度随风险走
+
+不是每张卡都要全套。按卡头「验收等级」做，PM 时间花在最可能出事的卡上：
+
+| 等级 | 适用 | 必做 | 可省 |
+|---|---|---|---|
+| L1 | T 卡、只写 `work/` 的产物 | 存在性、重跑 §8、引用抽查 ≥5 条 | 断言核对、变异 |
+| L2 | A 卡、补测试 | L1 + 断言核对 + 变异 3 点 | 现场二次重跑 |
+| L3 | B 卡、碰核心逻辑或回归脚本 | L2 + 变异 ≥6 点且每点带 `expect` + 全套件 + 现场红同环境重跑两次 | — |
+
+升级规则：执行者结果里出现「我改过的既有断言」非空、`git diff` 落到白名单外、或自报 PARTIAL → 至少按 L2 验。
+降级不允许：卡头写的等级是下限。
+
 ## 1. 三查的具体形态
 
 | 查什么 | 怎么做 | 漏掉的代价 |
@@ -25,9 +38,12 @@
 把**改动前版本**里每条断言/测试的标题抽出来，逐条到**当前版本**里找。
 
 ```
-node "$S/scripts/mutate-check.cjs" ...        # 见 §3
-node "$S/scripts/audit-assertions.cjs" <仓库绝对路径> <相对文件路径> [--ref HEAD] [--preset check]
+node "$S/scripts/audit-assertions.cjs" "仓库绝对路径" "相对文件路径,更多" --ref HEAD --preset test
 ```
+
+`--preset`：`test`（jest/vitest/mocha/node:test）、`check`（自定义 `r.check("标题", …)`）、`pytest`、`go`，
+或 `--pattern` 自给正则（捕获组 1 是标题）。脚本会报四类问题：标题消失、同名断言**出现次数变少**、
+标题还在但**新加了 .skip / xit / pytest.mark.skip**、新出现 `.only`（其余测试全部不跑）。
 
 判读规则：
 
@@ -44,15 +60,15 @@ node "$S/scripts/audit-assertions.cjs" <仓库绝对路径> <相对文件路径>
 # plan 文件（绝对路径，JSON）：
 {
   "repo": "D:/proj",
-  "files": ["src/parser.js", "src/rules.js"],
+  "timeout": 120,
   "cases": [
-    { "id": "M1", "file": "src/parser.js", "from": "if (c.startsWith(\"92\")) return 30;", "to": "", "cmd": "node tests/unit.mjs" },
+    { "id": "M1", "file": "src/parser.js", "from": "if (c.startsWith(\"92\")) return 30;", "to": "", "cmd": "node tests/unit.mjs", "expect": "北交所" },
     { "id": "M2", "file": "src/rules.js",  "from": "price >= upPrice - 1e-6", "to": "false", "cmd": "node tests/unit.mjs" }
   ]
 }
 ```
 ```
-node "$S/scripts/mutate-check.cjs" --plan "D:\\proj\\temp\\mutate-plan.json" --baseline
+node "$S/scripts/mutate-check.cjs" --plan "D:\\proj\\temp\\mutate-plan.json"
 ```
 
 要点：
@@ -61,6 +77,13 @@ node "$S/scripts/mutate-check.cjs" --plan "D:\\proj\\temp\\mutate-plan.json" --b
 - 每个变异点应该杀掉**具体哪几条**断言要能说出来；杀不掉的那条断言是装饰。
 - 变异必须在**副本/可还原**的前提下做，脚本结束要把文件还原并**逐字节校验**；
   未跟踪的新文件不能靠 `git checkout` 还原（会丢），所以驱动里自带备份。
+- **基线默认先跑，基线不绿直接中止**——基线红时所有变异都会"杀掉"，判定无意义。
+- `expect` 写上该变异应该打红的那条断言标题。红了但输出里没有它 = "红错地方"，不算杀掉。
+- **崩溃不算杀掉**：变异造成 SyntaxError / ReferenceError / 找不到模块，只说明代码坏了，不说明断言有效，换一个语义变异
+  （改比较符、改返回值、删一个分支），别用"删半行"这种会让语法崩的写法。
+- 变异造成死循环会按超时杀掉并注明；超时值在 plan 里调。
+- 结尾的 `RESULT cases=… killed=… survived=… wrong_kill=… skipped=…` 原样抄进台账验收列。
+- 要跑 `npm test` 这类 `.cmd` shim（Windows）时，case 里加 `"shell": true`。
 - 现场跑不了离线套件时（GUI/权限被拦），变异抽查照样能做——它是纯离线手段，别放弃这一招。
 
 ## 4. 现场红的分类法：先判"是哪一类红"
