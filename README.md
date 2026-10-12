@@ -1,6 +1,6 @@
 # pm-dispatch
 
-一个 Agent Skills 格式的技能：让**主会话担任项目经理**，把简单但耗时的机械任务写成自包含任务卡，按依赖图流水线式并行派发给轻量执行模型（flash 档；子代理、无头 CLI 或手动粘贴均可），结果落盘后由主会话按风险分级验收、打回和统合。可在 Qoder CLI、ZCode、Codex、Claude Code 等支持 `SKILL.md` 的客户端里使用。
+一个 Agent Skills 格式的技能：让**主会话担任项目经理**，把简单但耗时的机械任务写成自包含任务卡，按依赖图流水线式并行派发给轻量执行模型（flash 档，粘贴启动语到执行会话），结果落盘后由主会话按风险分级验收、打回和统合。可在 Qoder CLI、ZCode、Codex、Claude Code 等支持 `SKILL.md` 的客户端里使用。
 
 An Agent-Skills-format skill that turns the main session into a project manager: it writes self-contained task cards for cheap/fast execution models to run in parallel, then reviews, rejects, and integrates their output. Works in any client that loads `SKILL.md` skills.
 
@@ -20,7 +20,7 @@ An Agent-Skills-format skill that turns the main session into a project manager:
 | 一个 agent 把同工作树里另一个 agent 的未提交改动回滚掉 | 卡片硬安全边界明写"禁止回滚不属于本卡的改动" |
 | GUI 验收被权限分类器拦住，一卡白跑 | 「权限现实」：卡片写清前置命令，拦住不重试，改成用户起实例 / PM 只跑套件 |
 | 用户变成两个 agent 之间的人肉翻译层 | 卡片写明「不要提问，卡片没覆盖的记 BLOCKED 后停止」 |
-| 用户人肉搬运启动语、按批次干等最慢的那张卡 | `scripts/dispatch.cjs` 按依赖图算"现在能派谁"，支持子代理 / 无头 CLI 直接拉起 |
+| 用户人肉搬运启动语、按批次干等最慢的那张卡 | `scripts/dispatch.cjs` 按依赖图算"现在能派谁"，并为每张卡生成可直接粘贴的启动语 |
 | 每张卡都做全套验收，PM 成了瓶颈 | 卡头声明验收等级 L1/L2/L3，强度随风险走 |
 
 **分工原则**：判断留在主会话（架构、术语、验收标准、不可逆操作），执行外派出去（批量改写、数据收集、补测试、逐文件迁移）。
@@ -41,25 +41,9 @@ Windows 上 `~` 即 `C:\Users\<你的用户名>`。装完重启会话或 `/skill
 
 同一份内容在多个根里同时存在会被重复发现，挑一个根装即可（默认建议 `~/.agents/skills/`）。
 
-## 配置执行子代理（推荐，一次性）
-
-主会话用大模型当 PM、执行交给 flash 档模型，靠的是在 harness 里装一个**把 model 钉死在 flash 上**的自定义子代理 `pm-executor`。装好之后派卡不再需要开会话、复制启动语：
-
-| Harness | 模板 | 放到 | 派卡时点名 |
-|---|---|---|---|
-| Qoder | `pm-dispatch/assets/executors/qoder/pm-executor.md` | `.qoder/agents/` 或 `~/.qoder/agents/`（CN 版 `~/.qoder-cn/agents/`） | `pm-executor` |
-| ZCode | `pm-dispatch/assets/executors/zcode/pm-executor.md` | `~/.zcode/agents/` | `pm-executor` |
-| Codex | `pm-dispatch/assets/executors/codex/pm-executor.toml` | `~/.codex/agents/` 或 `.codex/agents/` | `pm_executor` |
-
-1. 把模板里的 `REPLACE_WITH_FLASH_MODEL` 换成你账号里 flash 档的模型（不换会直接报错，防止悄悄用上大模型）。
-2. 新开会话（Qoder 可 `/agents reload`）。
-3. 用一张只读 T 卡试跑 `dispatch.cjs next <目录> --agent pm-executor`，在用量统计里确认子代理跑的确实是 flash。
-
-安装细节、首次验证和已知坑（例如 `codex exec` 无头模式下会忽略子代理钉的模型）见 `pm-dispatch/references/executors.md`。
-
 ## 跨客户端
 
-不依赖任何单一客户端的专有能力——没用到 MCP，全流程只是文件读写加 Node 命令。客户端有子代理或无头 CLI 时会用来提速，没有就退回手动粘贴启动语。任务卡的交接契约也只是"卡片文件 + 结果文件 + 一段可粘贴启动语"，所以主会话和执行方可以是**不同客户端**：Qoder 当 PM、ZCode 里的轻量模型执行，反过来也行。
+不依赖任何单一客户端的专有能力——没用到 MCP，全流程只是文件读写加 Node 命令。派发统一用粘贴启动语（自动派发——子代理 / 无头 CLI——因各 harness 结构不同，暂不支持）。任务卡的交接契约也只是"卡片文件 + 结果文件 + 一段可粘贴启动语"，所以主会话和执行方可以是**不同客户端**：Qoder 当 PM、ZCode 里的轻量模型执行，反过来也行。
 
 唯一外部依赖是本机有 Node（跑 `scripts/check-cards.cjs`）。frontmatter 只保留 `name` 和 `description` 两个字段，以兼容各家对保留字段的规范差异。
 
@@ -88,7 +72,7 @@ Windows 上 `~` 即 `C:\Users\<你的用户名>`。装完重启会话或 `/skill
 
 ```
 $ node "$S/scripts/dispatch.cjs" status "/home/me/proj/.dispatch/demo"
-卡片 4 张 | 并发上限 2 | 派发方式 自动 | ledger 已读
+卡片 4 张 | 并发上限 2 | ledger 已读
   A02   待派      依赖 T01
   A03   待派      依赖 T01
   B04   待派      依赖 A02,A03  等 A02,A03
@@ -99,12 +83,7 @@ $ node "$S/scripts/dispatch.cjs" status "/home/me/proj/.dispatch/demo"
 ```
 
 - `status`：谁能派、谁在等、为什么暂缓（前置未放行 / 抢独占资源 / 写同一路径 / 并发满）。
-- `next`：给可派的卡生成 `prompts/卡号.txt` 启动语——贴给执行会话，或作为子代理任务原样发出。
-- `next --agent pm-executor`：直接打印一整段派发指令（点名子代理、每张卡一个、并行启动），PM 原样交给自己的子代理工具。
-- `run --exec "命令模板"`：用本机的无头 agent CLI 并行拉起，模板里 `%PROMPT_FILE%` `%CARD%` `%RESULT%` `%WORK%`
-  会替换成带引号的绝对路径；单卡超时、日志落 `work/卡号/_exec.log`、执行器结束后核对结果文件是否存在。
-
-**手动开关**：在 `ledger.md` 里写一行 `派发方式 手动`，调度器就拒绝 `next --agent` 和 `run`，只打印启动语给你粘贴；写 `派发方式 子代理` 只许子代理、`派发方式 无头` 只许 `run`。不写或写 `自动` 由 PM 按客户端能力选。开关写在台账里，换会话也不会丢。
+- `next`：给可派的卡生成 `prompts/卡号.txt` 启动语，一张卡开一个执行会话粘贴进去；重派时旧结果自动改名 `.retryN`。
 
 不再按"批次"一刀切：任何一张卡放行，被它解锁的卡立刻可派，被依赖越多的卡越先派。
 
@@ -204,24 +183,22 @@ pm-dispatch/
 ├── assets/card-template.md         十节任务卡模板：机读卡头（卡型/Blocked by/独占资源/验收等级）、红→绿对照、RESULT 机器行、打回 §10
 ├── references/acceptance.md        验收手册：L1/L2/L3 分级、机械核对/变异抽查、现场红五类分法、打回卡怎么写
 ├── references/discipline.md        跨批次纪律：基线与行号漂移、权限现实、执行者纠正 PM、卡片粒度
-├── references/executors.md         执行子代理：Qoder / ZCode / Codex 里把 pm-executor 钉在 flash 模型上，安装、首次验证、已知坑
-├── assets/executors/               三个 harness 的 pm-executor 模板 + 共用系统提示词
-├── references/known-pitfalls.md    踩坑库（Shell/Node/权限/进程/断言与判据/无头执行器/同工作树多卡/Git/弱模型特征）
+├── references/known-pitfalls.md    踩坑库（Shell/Node/权限/进程/断言与判据/执行会话/同工作树多卡/Git/弱模型特征）
 └── scripts/
     ├── lib/card.cjs                卡片解析公共部分（代码块感知的小节切分、卡头字段、白名单路径）
     ├── check-cards.cjs             派发前门禁：占位符、缺小节、越界命令、绝对路径、依赖环、白名单重叠
-    ├── dispatch.cjs                调度：status / next（启动语 / --agent 子代理派发指令）/ run（并行拉起无头执行器）
+    ├── dispatch.cjs                调度：status / next（生成启动语）
     ├── audit-assertions.cjs        回传后核对：断言标题消失、次数变少、新增 skip/only
     └── mutate-check.cjs            回传后核对：把代码改坏看会不会红（断言是不是恒真）
 
-tests/selftest.cjs                  脚本与子代理模板的自测（node tests/selftest.cjs，37 项）
+tests/selftest.cjs                  脚本自测（node tests/selftest.cjs，31 项）
 ```
 
 ## 变更（v3，提速 + 修门禁）
 
 **提速**
 - **流水线派发**：新增 `scripts/dispatch.cjs`，按依赖图 + 独占资源 + 写入白名单算"现在能派谁"，取代"整批放行才派下一批"。
-- **去掉人肉搬运**：Qoder / ZCode / Codex 各配一个钉死 flash 模型的 `pm-executor` 子代理（`assets/executors/`），主会话跑 `dispatch.cjs next --agent pm-executor` 直接并行派发；也可走无头 CLI（`dispatch.cjs run`），都不行才退回手动粘贴。
+- **启动语一键生成**：`dispatch.cjs next` 为每张可派的卡写好启动语，用户逐张粘贴进 flash 执行会话。自动派发（子代理 / 无头 CLI）因各 harness 结构不同，暂不提供。
 - **分级验收**：卡头声明 L1/L2/L3，T 卡不再被要求做变异抽查，B 卡则必须钉住具体断言。
 - **SKILL.md 瘦身**：基线纪律、权限现实、执行者纠正 PM 移到 `references/discipline.md`，每次加载少读约 40%。
 
