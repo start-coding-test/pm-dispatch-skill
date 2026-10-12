@@ -88,7 +88,7 @@ Windows 上 `~` 即 `C:\Users\<你的用户名>`。装完重启会话或 `/skill
 
 ```
 $ node "$S/scripts/dispatch.cjs" status "/home/me/proj/.dispatch/demo"
-卡片 4 张 | 并发上限 2 | ledger 已读
+卡片 4 张 | 并发上限 2 | 派发方式 自动 | ledger 已读
   A02   待派      依赖 T01
   A03   待派      依赖 T01
   B04   待派      依赖 A02,A03  等 A02,A03
@@ -103,6 +103,8 @@ $ node "$S/scripts/dispatch.cjs" status "/home/me/proj/.dispatch/demo"
 - `next --agent pm-executor`：直接打印一整段派发指令（点名子代理、每张卡一个、并行启动），PM 原样交给自己的子代理工具。
 - `run --exec "命令模板"`：用本机的无头 agent CLI 并行拉起，模板里 `%PROMPT_FILE%` `%CARD%` `%RESULT%` `%WORK%`
   会替换成带引号的绝对路径；单卡超时、日志落 `work/卡号/_exec.log`、执行器结束后核对结果文件是否存在。
+
+**手动开关**：在 `ledger.md` 里写一行 `派发方式 手动`，调度器就拒绝 `next --agent` 和 `run`，只打印启动语给你粘贴；写 `派发方式 子代理` 只许子代理、`派发方式 无头` 只许 `run`。不写或写 `自动` 由 PM 按客户端能力选。开关写在台账里，换会话也不会丢。
 
 不再按"批次"一刀切：任何一张卡放行，被它解锁的卡立刻可派，被依赖越多的卡越先派。
 
