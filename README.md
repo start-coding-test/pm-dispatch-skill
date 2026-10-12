@@ -1,8 +1,8 @@
 # pm-dispatch
 
-一个 Qoder CLI skill：让**主会话担任项目经理**，把简单但耗时的机械任务写成自包含任务卡，成批并行派发给轻量执行模型（flash 档），结果落盘后由主会话验收、打回和统合。
+一个 Agent Skills 格式的技能：让**主会话担任项目经理**，把简单但耗时的机械任务写成自包含任务卡，成批并行派发给轻量执行模型（flash 档），结果落盘后由主会话验收、打回和统合。可在 Qoder CLI、ZCode、Codex 等支持 `SKILL.md` 的客户端里使用。
 
-A Qoder CLI skill that turns the main session into a project manager: it writes self-contained task cards for cheap/fast execution models to run in parallel, then reviews, rejects, and integrates their output.
+An Agent-Skills-format skill that turns the main session into a project manager: it writes self-contained task cards for cheap/fast execution models to run in parallel, then reviews, rejects, and integrates their output. Works in any client that loads `SKILL.md` skills.
 
 ## 它解决的问题
 
@@ -20,10 +20,26 @@ A Qoder CLI skill that turns the main session into a project manager: it writes 
 
 把 `pm-dispatch/` 整个目录放进 Qoder 的技能目录：
 
-- 用户级（所有项目可用）：`C:\Users\<你的用户名>\.qoder-cn\skills\pm-dispatch\`
-- 项目级（仅当前项目）：`<项目根>\.qoder\skills\pm-dispatch\`
+把 `pm-dispatch/` 整个目录拷进任一技能根（格式是同一套 Agent Skills 规范：`SKILL.md` + `scripts/` + `references/` + `assets/`，`name` 等于目录名）：
 
-然后重启会话或执行 `/skills reload`，用 `/pm-dispatch <功能名>` 调用。
+| 客户端 | 用户级根 | 项目级根 |
+|---|---|---|
+| 跨工具通用位置 | `~/.agents/skills/` | `<project>/.agents/skills/` |
+| Qoder CLI | `~/.qoder-cn/skills/` | `<project>/.qoder/skills/` |
+| ZCode | `~/.zcode/skills/` | `<project>/.zcode/skills/` |
+| Codex | `~/.codex/skills/` | — |
+
+Windows 上 `~` 即 `C:\Users\<你的用户名>`。装完重启会话或 `/skills reload`，用 `/pm-dispatch <功能名>` 调用。
+
+同一份内容在多个根里同时存在会被重复发现，挑一个根装即可（默认建议 `~/.agents/skills/`）。
+
+## 跨客户端
+
+不依赖任何单一客户端的专有能力——没用到子代理、没用到 MCP，全流程只是文件读写加一条 Node 命令。任务卡的交接契约也只是"卡片文件 + 结果文件 + 一段可粘贴启动语"，所以主会话和执行方可以是**不同客户端**：Qoder 当 PM、ZCode 里的轻量模型执行，反过来也行。
+
+唯一外部依赖是本机有 Node（跑 `scripts/check-cards.cjs`）。frontmatter 只保留 `name` 和 `description` 两个字段，以兼容各家对保留字段的规范差异。
+
+技能根的定位写在 SKILL.md 的门禁命令里，按 `~/.agents` → `~/.qoder-cn` → `~/.zcode` → `~/.codex` 顺序探测，不写死单一安装目录。
 
 ## 触发方式
 
@@ -50,7 +66,8 @@ A Qoder CLI skill that turns the main session into a project manager: it writes 
 `scripts/check-cards.cjs` 检查：占位符残留、必需小节缺失、`Blocked by` 缺失、写入与回传路径未用绝对路径、命令里出现 git 写操作 / 按名字杀进程 / 安装依赖 / 管道执行远程脚本。
 
 ```
-$ node "$HOME/.qoder-cn/skills/pm-dispatch/scripts/check-cards.cjs" "<项目绝对路径>\.dispatch\demo\cards"
+$ S="$(ls -d "$HOME/.agents/skills/pm-dispatch" "$HOME/.qoder-cn/skills/pm-dispatch" "$HOME/.zcode/skills/pm-dispatch" "$HOME/.codex/skills/pm-dispatch" 2>/dev/null | head -1)"
+$ node "$S/scripts/check-cards.cjs" "<项目绝对路径>\.dispatch\demo\cards"
 扫描 2 张卡片
   T01-clean.md  OK
   T02-dirty.md

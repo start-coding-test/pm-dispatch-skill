@@ -89,9 +89,12 @@ function checkFile(file) {
       if (/^[a-z]+:$/.test(inner)) continue;
       add('ERROR', i + 1, '疑似占位符，执行 agent 会原样照抄', m[0]);
     }
-    // 5. 越界命令
-    for (const [re, why] of FORBIDDEN) {
-      if (re.test(ln)) add('ERROR', i + 1, why, ln);
+    // 5. 越界命令（正文里的禁令引用命令名不算违规，代码块里的照样抓）
+    const isProhibition = !fence && /(禁止|严禁|不许|不得|不要|禁用)/.test(ln);
+    if (!isProhibition) {
+      for (const [re, why] of FORBIDDEN) {
+        if (re.test(ln)) add('ERROR', i + 1, why, ln);
+      }
     }
     // 6. 命令用相对路径
     if ((fence || /^\s*\$ /.test(ln) || /^\s*node\s/.test(ln)) && NEEDS_ABS.test(ln) && RELATIVE_PATH.test(ln) &&
@@ -124,7 +127,7 @@ function main() {
   }
   const stat = fs.statSync(target);
   const files = stat.isDirectory()
-    ? fs.readdirSync(target).filter(f => /\.md$/i.test(f) && !/^_|^README/i.test(f)).map(f => path.join(target, f))
+    ? fs.readdirSync(target).filter(f => /\.md$/i.test(f) && !/^_|^(?:README|SKILL)\./i.test(f)).map(f => path.join(target, f))
     : [target];
 
   if (!files.length) {

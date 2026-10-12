@@ -1,7 +1,6 @@
 ---
 name: pm-dispatch
-description: 主会话担任项目经理，把简单但耗时的机械任务写成自包含任务卡，成批并行派发给 flash 档执行模型，执行结果落盘后由主会话验收、打回和统合。当用户说"派卡""外包给 flash""并行执行这些任务""你只当 PM 别自己写""机械的活排给我""回传后验收""这批活太耗时"，或 to-tickets 的任务里有可独立验证的机械切片时使用。不用于架构决策、术语定义、不可逆操作，以及需要跨文件全局推理的工作。
-argument-hint: <功能名或待派发的任务集>
+description: 主会话担任项目经理，把简单但耗时的机械任务写成自包含任务卡，成批并行派发给轻量执行模型（flash 档）跑，执行结果落盘后由主会话验收、打回和统合。当用户说"派卡""外包给 flash""并行执行这些任务""你只当 PM 别自己写""机械的活排给我""回传后验收""这批活太耗时"，或 to-tickets 的任务里有可独立验证的机械切片时使用。调用时带上功能名或任务集。不用于架构决策、术语定义、不可逆操作，以及需要跨文件全局推理的工作。
 ---
 
 # 项目经理派发（PM Dispatch）
@@ -64,9 +63,10 @@ argument-hint: <功能名或待派发的任务集>
 
 1. 消费 `to-tickets` 的任务集，或直接把当前对话/spec 切成机械切片；每张声明 `Blocked by`。
 2. 建好 `.dispatch/<功能名>/` 骨架与 `ledger.md`。
-3. 逐张写卡，跑静态检查抓占位符和缺失小节（Qoder 的 Bash 工具里 `$HOME` 会展开成本机用户目录，无需改成绝对路径）：
+3. 逐张写卡，跑静态检查抓占位符和缺失小节。脚本跟着本技能走，先定位技能根再调用（跨客户端通用，别写死某一个安装目录）：
    ```
-   node "$HOME/.qoder-cn/skills/pm-dispatch/scripts/check-cards.cjs" "<项目绝对路径>\.dispatch\<功能名>\cards"
+   S="$(ls -d "$HOME/.agents/skills/pm-dispatch" "$HOME/.qoder-cn/skills/pm-dispatch" "$HOME/.zcode/skills/pm-dispatch" "$HOME/.codex/skills/pm-dispatch" 2>/dev/null | head -1)"
+   node "$S/scripts/check-cards.cjs" "<项目绝对路径>\.dispatch\<功能名>\cards"
    ```
    有 ERROR 就改卡，改到 0 error 才许派发。
 
