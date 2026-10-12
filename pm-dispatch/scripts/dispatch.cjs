@@ -1,55 +1,36 @@
 #!/usr/bin/env node
 'use strict';
-// 调度器：读 cards/ 与 ledger.md，算出"现在能派哪几张"，生成启动语，可选直接拉起无头执行器。
+// 调度器：读 cards/ 与 ledger.md，算出"现在能派哪几张"，生成启动语交给用户粘贴到执行会话。
 // 取代"按批次一刀切"：一张卡的前置全部 PASS、且与在跑的卡不抢独占资源/不写同一路径，就立刻可派（流水线）。
 //
 // 用法:
 //   node dispatch.cjs status <.dispatch/功能名 绝对路径>
-//   node dispatch.cjs next   <.dispatch/功能名 绝对路径> [--max N] [--agent 子代理名]
-//   node dispatch.cjs run    <.dispatch/功能名 绝对路径> --exec "命令模板" [--max N] [--timeout 分钟]
+//   node dispatch.cjs next   <.dispatch/功能名 绝对路径> [--max N]
 //
-// next：为可派的卡写 prompts/卡号.txt 并打印启动语（手动粘贴，或交给客户端的子代理工具）。
-//       加 --agent 时改为打印一整段派发指令：点名该子代理、每张卡一个、并行启动，PM 原样交给自己的子代理工具。
-//       子代理怎么配（钉 flash 模型）见 references/executors.md。
-// run ：对每张可派的卡并行执行 --exec 模板，模板里用 %PROMPT_FILE% %CARD% %CARD_ID% %RESULT% %WORK%
-//       代表本卡的文件路径（脚本替换为带引号的绝对路径），所有执行器结束后汇总退出码。
-//       日志写到 work/卡号/_exec.log。执行器把结果写进 results/卡号.md，验收仍由 PM 做。
+// next：为可派的卡写 prompts/卡号.txt 并打印启动语，一张卡开一个执行会话粘贴进去。
+//       （自动派发——子代理 / 无头 CLI——因各 harness 结构不同，暂不支持。）
 //
 // ledger.md 里的表格需要有「卡」「状态」两列，可选「验收」列：
 //   状态 = 待派 | 执行中 | 已回 | 打回 | BLOCKED | 放行；验收列以 PASS 开头、或状态为"放行"，视为前置已满足。
 // 并发上限读 ledger 里的"并发上限 N"，--max 可覆盖，默认 3。
-// 派发开关读 ledger 里的"派发方式 手动|子代理|无头"（不写 = 自动，PM 按客户端能力选）：
-//   手动 → 拒绝 next --agent 和 run，只打印启动语给用户粘贴；子代理 → 拒绝 run；无头 → 拒绝 next --agent。
-//   被拒时在写 prompts、改名旧结果之前就退出（退出码 2）。
-// 退出码: 0 正常 / 1 run 中有执行器失败或没有可派的卡 / 2 用法或数据错误
+// 退出码: 0 正常 / 1 没有可派的卡 / 2 用法或数据错误
 
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
 const C = require('./lib/card.cjs');
 
 function parseArgs(argv) {
   const [cmd, dir, ...rest] = argv;
-  const opt = { max: null, exec: null, timeout: 60, agent: null };
+  if (!['status', 'next'].includes(cmd) || !dir) {
+    throw new Error('用法: dispatch.cjs status|next <.dispatch/功能名 绝对路径> [--max N]（自动派发 run / --agent 暂不支持）');
+  }
+  const opt = { max: null };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--max') opt.max = parseInt(rest[++i], 10);
-    else if (a === '--exec') opt.exec = rest[++i];
-    else if (a === '--timeout') opt.timeout = parseFloat(rest[++i]);
-    else if (a === '--agent') opt.agent = rest[++i];
-    else if (a.startsWith('--agent=')) opt.agent = a.slice(8);
     else if (a.startsWith('--max=')) opt.max = parseInt(a.slice(6), 10);
-    else if (a.startsWith('--exec=')) opt.exec = a.slice(7);
-    else if (a.startsWith('--timeout=')) opt.timeout = parseFloat(a.slice(10));
     else throw new Error(`未知参数 ${a}`);
   }
-  if (opt.agent !== null && !/^[\w.-]+$/.test(opt.agent || '')) {
-    throw new Error(`--agent 子代理名只能含字母、数字、下划线、点、连字符: ${opt.agent}`);
-  }
-  if (!['status', 'next', 'run'].includes(cmd) || !dir) {
-    throw new Error('用法: dispatch.cjs status|next|run <.dispatch/功能名 绝对路径> [--max N] [--exec "模板"] [--agent 子代理名]');
-  }
-  if (cmd === 'run' && !opt.exec) throw new Error('run 需要 --exec "命令模板"');
   return { cmd, dir: path.resolve(dir.replace(/^"|"$/g, '')), opt };
 }
 
@@ -57,13 +38,10 @@ function readLedger(dir) {
   const f = path.join(dir, 'ledger.md');
   const rows = new Map();
   let limit = null;
-  let mode = null;
-  if (!fs.existsSync(f)) return { rows, limit, mode, exists: false };
+  if (!fs.existsSync(f)) return { rows, limit, exists: false };
   const text = fs.readFileSync(f, 'utf8');
   const m = /并发上限\s*[:：]?\s*(\d+)/.exec(text);
   if (m) limit = parseInt(m[1], 10);
-  const md = /派发方式\s*[:：]?\s*\**\s*(手动|人工|子代理|无头|自动)/.exec(text);
-  if (md) mode = md[1] === '人工' ? '手动' : md[1] === '自动' ? null : md[1];
   let cols = null;
   for (const ln of text.split(/\r?\n/)) {
     if (!/^\s*\|/.test(ln)) { cols = null; continue; }
@@ -77,7 +55,7 @@ function readLedger(dir) {
     const id = get('卡').replace(/\*+/g, '');
     if (id) rows.set(id, { state: get('状态').replace(/\*+/g, ''), verdict: get('验收').replace(/\*+/g, '') });
   }
-  return { rows, limit, mode, exists: true };
+  return { rows, limit, exists: true };
 }
 
 function classify(row) {
@@ -162,18 +140,8 @@ function launchText(dir, c) {
   ].join('\n');
 }
 
-// 一整段派发指令：PM 交给自己的子代理工具（Qoder / ZCode / Codex 都靠点名自定义子代理来钉模型）
-function agentText(dir, chosen, agent) {
-  const out = [
-    `并行启动 ${chosen.length} 个 ${agent} 子代理，每张卡一个，必须使用 ${agent}，不要换成 general-purpose / default 或自己动手。`,
-    '把每张卡下面的任务原文一字不改地交给对应的子代理。等全部返回后，只汇总每张卡回复的那一行（结果文件路径 + 状态词），不要替它们补做或修改产物。',
-  ];
-  for (const c of chosen) out.push('', `=== ${c.id} ===`, launchText(dir, c));
-  return out.join('\n');
-}
-
 function printStatus(p, max) {
-  console.log(`卡片 ${p.cards.length} 张 | 并发上限 ${max} | 派发方式 ${p.ledger.mode || '自动'} | ledger ${p.ledger.exists ? '已读' : '不存在（全部按待派处理）'}`);
+  console.log(`卡片 ${p.cards.length} 张 | 并发上限 ${max} | ledger ${p.ledger.exists ? '已读' : '不存在（全部按待派处理）'}`);
   for (const c of p.cards) {
     const deps = c.blockedBy.length ? c.blockedBy.join(',') : '无';
     const wait = c.waitingOn.length ? `  等 ${c.waitingOn.join(',')}` : '';
@@ -198,40 +166,11 @@ function writePrompts(dir, chosen) {
   }
 }
 
-function q(s) { return `"${s.replace(/"/g, '\\"')}"`; }
-
-function runOne(dir, c, template, timeoutMin) {
-  const p = pathsFor(dir, c);
-  const cmd = template
-    .replace(/%PROMPT_FILE%/g, q(p.prompt)).replace(/%CARD%/g, q(p.card))
-    .replace(/%CARD_ID%/g, c.id).replace(/%RESULT%/g, q(p.result)).replace(/%WORK%/g, q(p.work));
-  const log = fs.openSync(path.join(p.work, '_exec.log'), 'a');
-  fs.writeSync(log, `\n=== ${new Date().toISOString()} ${cmd}\n`);
-  const started = Date.now();
-  return new Promise((resolve) => {
-    const child = spawn(cmd, { shell: true, cwd: dir, stdio: ['ignore', log, log] });
-    const timer = setTimeout(() => { child.kill(); }, timeoutMin * 60 * 1000);
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      fs.closeSync(log);
-      resolve({ c, code, signal, secs: Math.round((Date.now() - started) / 1000), hasResult: fs.existsSync(p.result) });
-    });
-    child.on('error', (e) => { clearTimeout(timer); fs.writeSync(log, String(e)); });
-  });
-}
-
-async function main() {
+function main() {
   const { cmd, dir, opt } = parseArgs(process.argv.slice(2));
   if (!fs.existsSync(dir)) throw new Error(`目录不存在: ${dir}`);
   const p = plan(dir);
   const max = opt.max || p.ledger.limit || 3;
-  const mode = p.ledger.mode;
-  const how = cmd === 'run' ? '无头' : cmd === 'next' && opt.agent ? '子代理' : cmd === 'next' ? '手动' : null;
-  if (mode && how && how !== '手动' && how !== mode) { // 不带 --agent 的 next 只打印启动语，任何方式下都允许
-    throw new Error(`ledger 设了"派发方式 ${mode}"，不允许${how === '无头' ? ' run（无头 CLI）' : ' next --agent（子代理）'}。` +
-      (mode === '手动' ? '用 next（不带 --agent）打印启动语交给用户粘贴；' : mode === '子代理' ? '用 next --agent 子代理名；' : '用 run --exec；') +
-      '要换方式先改 ledger 里那一行。');
-  }
 
   if (cmd === 'status') {
     printStatus(p, max);
@@ -249,32 +188,12 @@ async function main() {
   }
   writePrompts(dir, chosen);
 
-  if (cmd === 'next' && opt.agent) {
-    console.log(agentText(dir, chosen, opt.agent));
-    console.log(`\n已写入 ${chosen.length} 份启动语到 ${path.join(dir, 'prompts')}。把上面整段交给子代理工具；派出后把这些卡在 ledger 里改成"执行中"。`);
-    process.exit(0);
+  for (const c of chosen) {
+    console.log(`\n----- ${c.id} ${c.title.replace(/^[A-Z]\d+[a-z]?\s*/, '')} -----`);
+    console.log(launchText(dir, c));
   }
-
-  if (cmd === 'next') {
-    for (const c of chosen) {
-      console.log(`\n----- ${c.id} ${c.title.replace(/^[A-Z]\d+[a-z]?\s*/, '')} -----`);
-      console.log(launchText(dir, c));
-    }
-    console.log(`\n已写入 ${chosen.length} 份启动语到 ${path.join(dir, 'prompts')}。派出后把这些卡在 ledger 里改成"执行中"。`);
-    process.exit(0);
-  }
-
-  // run
-  console.log(`并行拉起 ${chosen.length} 个执行器：${chosen.map((c) => c.id).join(', ')}（单卡超时 ${opt.timeout} 分钟）`);
-  const results = await Promise.all(chosen.map((c) => runOne(dir, c, opt.exec, opt.timeout)));
-  let bad = 0;
-  for (const r of results) {
-    const ok = r.code === 0 && r.hasResult;
-    if (!ok) bad++;
-    console.log(`  ${r.c.id.padEnd(5)} rc=${r.code}${r.signal ? ' ' + r.signal : ''} ${r.secs}s 结果文件${r.hasResult ? '已写' : '缺失'}  ${ok ? '待验收' : '异常，看 work/' + r.c.id + '/_exec.log'}`);
-  }
-  console.log(`\n执行器全部结束：${results.length - bad} 张待验收，${bad} 张异常。退出码 0 只代表执行器跑完，不代表通过——按 references/acceptance.md 验收。`);
-  process.exit(bad ? 1 : 0);
+  console.log(`\n已写入 ${chosen.length} 份启动语到 ${path.join(dir, 'prompts')}。一张卡开一个执行会话粘贴；派出后把这些卡在 ledger 里改成"执行中"。`);
+  process.exit(0);
 }
 
-main().catch((e) => { console.log(`ERROR ${e.message}`); process.exit(2); });
+try { main(); } catch (e) { console.log(`ERROR ${e.message}`); process.exit(2); }
