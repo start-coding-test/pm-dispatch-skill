@@ -18,6 +18,9 @@
 // ledger.md 里的表格需要有「卡」「状态」两列，可选「验收」列：
 //   状态 = 待派 | 执行中 | 已回 | 打回 | BLOCKED | 放行；验收列以 PASS 开头、或状态为"放行"，视为前置已满足。
 // 并发上限读 ledger 里的"并发上限 N"，--max 可覆盖，默认 3。
+// 派发开关读 ledger 里的"派发方式 手动|子代理|无头"（不写 = 自动，PM 按客户端能力选）：
+//   手动 → 拒绝 next --agent 和 run，只打印启动语给用户粘贴；子代理 → 拒绝 run；无头 → 拒绝 next --agent。
+//   被拒时在写 prompts、改名旧结果之前就退出（退出码 2）。
 // 退出码: 0 正常 / 1 run 中有执行器失败或没有可派的卡 / 2 用法或数据错误
 
 const fs = require('fs');
@@ -54,10 +57,13 @@ function readLedger(dir) {
   const f = path.join(dir, 'ledger.md');
   const rows = new Map();
   let limit = null;
-  if (!fs.existsSync(f)) return { rows, limit, exists: false };
+  let mode = null;
+  if (!fs.existsSync(f)) return { rows, limit, mode, exists: false };
   const text = fs.readFileSync(f, 'utf8');
   const m = /并发上限\s*[:：]?\s*(\d+)/.exec(text);
   if (m) limit = parseInt(m[1], 10);
+  const md = /派发方式\s*[:：]?\s*\**\s*(手动|人工|子代理|无头|自动)/.exec(text);
+  if (md) mode = md[1] === '人工' ? '手动' : md[1] === '自动' ? null : md[1];
   let cols = null;
   for (const ln of text.split(/\r?\n/)) {
     if (!/^\s*\|/.test(ln)) { cols = null; continue; }
@@ -71,7 +77,7 @@ function readLedger(dir) {
     const id = get('卡').replace(/\*+/g, '');
     if (id) rows.set(id, { state: get('状态').replace(/\*+/g, ''), verdict: get('验收').replace(/\*+/g, '') });
   }
-  return { rows, limit, exists: true };
+  return { rows, limit, mode, exists: true };
 }
 
 function classify(row) {
@@ -167,7 +173,7 @@ function agentText(dir, chosen, agent) {
 }
 
 function printStatus(p, max) {
-  console.log(`卡片 ${p.cards.length} 张 | 并发上限 ${max} | ledger ${p.ledger.exists ? '已读' : '不存在（全部按待派处理）'}`);
+  console.log(`卡片 ${p.cards.length} 张 | 并发上限 ${max} | 派发方式 ${p.ledger.mode || '自动'} | ledger ${p.ledger.exists ? '已读' : '不存在（全部按待派处理）'}`);
   for (const c of p.cards) {
     const deps = c.blockedBy.length ? c.blockedBy.join(',') : '无';
     const wait = c.waitingOn.length ? `  等 ${c.waitingOn.join(',')}` : '';
@@ -219,6 +225,13 @@ async function main() {
   if (!fs.existsSync(dir)) throw new Error(`目录不存在: ${dir}`);
   const p = plan(dir);
   const max = opt.max || p.ledger.limit || 3;
+  const mode = p.ledger.mode;
+  const how = cmd === 'run' ? '无头' : cmd === 'next' && opt.agent ? '子代理' : cmd === 'next' ? '手动' : null;
+  if (mode && how && how !== '手动' && how !== mode) { // 不带 --agent 的 next 只打印启动语，任何方式下都允许
+    throw new Error(`ledger 设了"派发方式 ${mode}"，不允许${how === '无头' ? ' run（无头 CLI）' : ' next --agent（子代理）'}。` +
+      (mode === '手动' ? '用 next（不带 --agent）打印启动语交给用户粘贴；' : mode === '子代理' ? '用 next --agent 子代理名；' : '用 run --exec；') +
+      '要换方式先改 ledger 里那一行。');
+  }
 
   if (cmd === 'status') {
     printStatus(p, max);
