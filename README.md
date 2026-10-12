@@ -10,8 +10,15 @@ An Agent-Skills-format skill that turns the main session into a project manager:
 |---|---|
 | 执行 agent 看不到主会话的对话上下文 | 卡片十节强制包含背景、输入事实、允许写入路径 |
 | 弱模型照抄 `<owner>`、`{{路径}}` 这类槽位 | 派发前用 `scripts/check-cards.cjs` 静态门禁，有 error 不许派发 |
-| 多个任务并行写同一文件互相覆盖 | 一卡一 `work\Txx\` 目录 + 一结果文件，写入面白名单锁死 |
+| 多个任务并行写同一文件互相覆盖 | 一卡一 `work\Txx\` 目录 + 白名单 + 排批时按"独占资源/同文件"互斥 |
 | 执行 agent 把"没做到"汇报成"已完成" | 验收命令由主会话亲自重跑，用真实输出判定 PASS/FAIL |
+| 回归脚本被静默改松（删断言、改名、调大上限凑绿） | `scripts/audit-assertions.cjs` 机械核对旧版本里每条断言标题是否还在 |
+| 断言全绿但其实什么都不判（恒真） | `scripts/mutate-check.cjs` 把代码逐点改坏，看断言会不会红；不红即打回 |
+| 卡片写了物理上做不到的判据 | SKILL.md「四条铁律」要求下发前自问"这条能成立吗" |
+| 一批改动让后续卡片引用的行号失效 | 「基线纪律」：每批放行后立刻更新矩阵数字与下一批卡的 `文件:行号` |
+| 删掉旧入口的卡排在前面，替代入口排在最后 | 排批规则第 4 条：删入口必须与替代入口同批或更晚 |
+| 一个 agent 把同工作树里另一个 agent 的未提交改动回滚掉 | 卡片硬安全边界明写"禁止回滚不属于本卡的改动" |
+| GUI 验收被权限分类器拦住，一卡白跑 | 「权限现实」：卡片写清前置命令，拦住不重试，改成用户起实例 / PM 只跑套件 |
 | 用户变成两个 agent 之间的人肉翻译层 | 卡片写明「不要提问，卡片没覆盖的记 BLOCKED 后停止」 |
 
 **分工原则**：判断留在主会话（架构、术语、验收标准、不可逆操作），执行外派出去（批量改写、数据收集、补测试、逐文件迁移）。
@@ -89,6 +96,53 @@ $ node "$S/scripts/check-cards.cjs" "<项目绝对路径>\.dispatch\demo\cards"
 
 加 `--warn-as-error` 可让相对路径告警也拦下派发。退出码：0 可派发 / 1 需修卡 / 2 用法或路径错误。
 
+## 验收工具（两个新脚本）
+
+技能原本只有"派发前"的门禁，缺"回传后"的手段。这两个把 PM 验收里最容易被糊弄的两步变成可跑的命令。
+
+**1. 回归没有变松** —— 旧版本里每条断言/测试标题，逐条到当前版本里找：
+
+```
+$ node "$S/scripts/audit-assertions.cjs" "D:/proj" "scripts/verify-x.mjs,src/a.test.ts" --preset check --ref HEAD --show-added
+### scripts/verify-x.mjs   (对照 HEAD)
+  HEAD: 155 条唯一标题 / 现在: 157 条
+  消失: 1 条  ← 逐条要么在新代码里找到对应新标题，要么就是放宽回归
+    - 五档来自腾讯（与快照是同一条接口的两段）
+  新增: 3 条
+    + 五档源符合本轮可用性（非首选源必须有失败记录解释）
+汇总: 2 个文件, 消失标题 1 条
+结论: 有标题消失，逐条对应对后才能放行
+```
+
+`--preset check` 适配自定义 `r.check("标题", …)`，`--preset test` 适配 jest/vitest/node:test，
+自家形状用 `--pattern='…(捕获组1是标题)…'`。退出码：0 无标题消失 / 1 有消失 / 2 用法错。
+
+**2. 断言不是恒真** —— 表驱动的变异抽查，在备份保护下把代码逐点改坏：
+
+```
+// D:/proj/temp/mutate-plan.json
+{ "repo": "D:/proj",
+  "cases": [
+    { "id": "M1", "file": "src/parser.js", "from": "if (c.startsWith(\"92\")) return 30;", "to": "", "cmd": "node tests/unit.mjs" },
+    { "id": "M2", "file": "src/rules.js",  "from": "up !== null && price >= up - 1e-6", "to": "true", "cmd": "node tests/unit.mjs" }
+  ] }
+```
+```
+$ node "$S/scripts/mutate-check.cjs" --plan "D:/proj/temp/mutate-plan.json" --baseline
+用例 2 个、涉及文件 2 个 → 备份在 D:\proj\temp\mutate-check-20261012T073938
+基线（未变异）:
+  node tests/unit.mjs  → rc=0 RESULT pass=4 fail=0
+M1  杀掉（断言有效）  rc=1 RESULT pass=3 fail=1
+     ↳ FAIL 北交所 920185 给 30 :: got 10 want 30
+M2  没杀掉（恒真/覆盖不足）  rc=0 RESULT pass=4 fail=0
+还原校验：2 个文件逐字节一致
+结论: 1 个变异没被杀掉（其中锚点无效 0 个）—— 补断言、修锚点，或打回
+```
+
+要点：一次只改一个点；`from` 必须唯一命中（不唯一直接 SKIP 并计为未验证）；
+结束自动还原并逐字节校验，所以**未跟踪的新文件也不会丢**（不靠 `git checkout`）。
+`--keep-backup` 保留备份目录。退出码：0 全杀掉 / 1 有漏网或锚点无效 / 2 用法或还原失败。
+
 ## 在构建链中的位置
 
 ```
@@ -102,11 +156,30 @@ grill-with-docs → to-spec → to-tickets ─┬─ 判断类 → implement →
 
 ```
 pm-dispatch/
-├── SKILL.md                       角色边界、分诊表、写卡→派发→验收→统合→台账五段流程
-├── assets/card-template.md        十节任务卡模板，含结果文件回传格式
-├── references/known-pitfalls.md   踩坑库（Windows/Node/进程/Git/目录卫生/弱模型行为特征）
-└── scripts/check-cards.cjs        派发前静态门禁，零依赖 Node
+├── SKILL.md                        角色边界、分诊表、卡型、写卡→排批→验收→统合→基线→台账
+├── assets/card-template.md         十节任务卡模板：批次互斥声明、红→绿对照、状态词表、RESULT 机器行、打回 §10 的结构
+├── references/acceptance.md        验收手法手册：三查具体化、机械核对/变异抽查、现场红的五类分法、打回卡怎么写
+├── references/known-pitfalls.md    踩坑库（Shell/Node/权限/进程/断言与判据/取证卡写法/同工作树多卡/Git/目录卫生/弱模型特征）
+└── scripts/
+    ├── check-cards.cjs             派发前静态门禁：占位符、缺小节、越界命令、非绝对路径
+    ├── audit-assertions.cjs        回传后核对：旧版每条断言标题是否还在（回归有没有变松）
+    └── mutate-check.cjs            回传后核对：把代码改坏看点不红（断言是不是恒真）
 ```
+
+## 变更（v2，来自一轮真实派发）
+
+一轮 10 张卡跑下来，返工的原因几乎都不在"执行者能力差"，而在 PM 侧的四个缺口，本版逐条补上：
+
+- **验收只有"重跑"这一招** → 补 `references/acceptance.md` 与两个脚本：机械核对断言标题、变异抽查证明非恒真、
+  `文件:行号` 抽样对原文；并给出"现场红的五类分法"（代码红/断言红/判定输入红/环境红/时序红），
+  只有第一类该打回执行卡。
+- **卡片判据没验过"能不能做到"** → 铁律加一条，并收了三条真实反例（文案长度超出容器容量、
+  要求序列化后"逐字节未变"、把同意框触发时机钉死成"首次调用"）。
+- **排批只看依赖不看独占资源** → 排批规则四条：独占型资源互斥、同文件互斥、离线卡才是并行位、
+  **删入口的卡必须与替代入口同批或更晚**。
+- **跨批次会烂的东西没人管** → 新增「基线纪律」（运行数下限、行号漂移、外部可用性不是代码属性）
+  与「权限现实」（谁起 GUI 实例、拦住不重试、PM 未复跑必须单独记一节）。
+- **执行者反过来纠正 PM 是常态** → 新增处置规矩：复现后采纳，并回改到源头（卡片 + 规格 + 约定表）。
 
 ## 来源与署名
 
