@@ -89,7 +89,7 @@ node "$S/scripts/dispatch.cjs" next   "项目绝对路径/.dispatch/功能名"  
 
 ## 可选：云端 PM（Notion）
 
-功能目录里有 `cloud-pm.json` 时，执行者卡住或做完可主动运行 `scripts/pm-ask.cjs` 呼叫 Notion 里的云端 PM，按回复继续，不必停下等用户。只做主动触发。云端 PM 跑不了命令，它的 `merge` 只算预审，**验收照旧由主会话重跑**；它拆出的新任务要改写成正式卡片过门禁再派。写卡要加的三行与指令页见 `references/cloud-pm.md`。
+功能目录里有 `cloud-pm.json` 时，执行者可用配套技能 `pm-ask`（装在执行者的客户端）主动呼叫 Notion 里的云端 PM，按回复继续，不必停下等用户。只做主动触发。云端 PM 跑不了命令，它的 `merge` 只算预审，**验收照旧由主会话重跑**；它拆出的新任务要改写成正式卡片过门禁再派。写卡要加的三行与指令页见 `references/cloud-pm.md`。
 
 ## 验收：强度随风险走（照 `references/acceptance.md` 做）
 
