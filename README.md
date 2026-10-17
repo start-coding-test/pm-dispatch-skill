@@ -39,6 +39,8 @@ An Agent-Skills-format skill that turns the main session into a project manager:
 
 Windows 上 `~` 即 `C:\Users\<你的用户名>`。装完重启会话或 `/skills reload`，用 `/pm-dispatch <功能名>` 调用。
 
+可选的配套技能 `pm-ask/`（执行者呼叫 Notion 云端 PM）装在**执行者用的客户端**里，方法相同；PM 那边不用装。
+
 同一份内容在多个根里同时存在会被重复发现，挑一个根装即可（默认建议 `~/.agents/skills/`）。
 
 ## 跨客户端
@@ -168,10 +170,10 @@ RESULT cases=2 killed=1 survived=1 wrong_kill=0 skipped=0
 
 ## 可选：云端 PM（Notion Custom Agent）
 
-执行 agent 卡住（`blocked`）、做完申请合并（`merge`）或需要拍板（`review`）时，主动运行 `scripts/pm-ask.cjs` 呼叫常驻 Notion 的云端 PM。脚本自动带上卡片、台账行、结果文件、只读 git 上下文，回复和 JSON 决策块落到本卡 `work/<卡号>/`。只做主动触发，不接 webhook；云端 PM 不合并、不提交，验收仍由主会话重跑。需要 Notion Business 及以上和一个个人访问令牌。配置、写卡要加的三行、指令页全文见 [`pm-dispatch/references/cloud-pm.md`](pm-dispatch/references/cloud-pm.md)。
+执行 agent 卡住（`blocked`）、做完申请合并（`merge`）或需要拍板（`review`）时，用配套技能 **pm-ask**（`pm-ask/` 目录，装在执行者的客户端）呼叫常驻 Notion 的云端 PM。pm-dispatch 给 PM 用，pm-ask 给执行者用，分开装。脚本自动带上卡片、台账行、结果文件、只读 git 上下文，回复和 JSON 决策块落到本卡 `work/<卡号>/`。只做主动触发，不接 webhook；云端 PM 不合并、不提交，验收仍由主会话重跑。需要 Notion Business 及以上和一个个人访问令牌。PM 侧配置、写卡要加的三行、指令页见 [`pm-dispatch/references/cloud-pm.md`](pm-dispatch/references/cloud-pm.md)；执行者什么时候呼叫、回复怎么处理见 [`pm-ask/SKILL.md`](pm-ask/SKILL.md)。
 
 ```
-node "$S/scripts/pm-ask.cjs" blocked --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg "卡在哪、试过什么"
+node "$P/scripts/pm-ask.cjs" blocked --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg "卡在哪、试过什么"
 ```
 
 ## 在构建链中的位置
@@ -198,8 +200,11 @@ pm-dispatch/
     ├── check-cards.cjs             派发前门禁：占位符、缺小节、越界命令、绝对路径、依赖环、白名单重叠
     ├── dispatch.cjs                调度：status / next（生成启动语）
     ├── audit-assertions.cjs        回传后核对：断言标题消失、次数变少、新增 skip/only
-    ├── mutate-check.cjs            回传后核对：把代码改坏看会不会红（断言是不是恒真）
-    └── pm-ask.cjs                  可选：执行者主动呼叫 Notion 云端 PM（blocked / merge / review）
+    └── mutate-check.cjs            回传后核对：把代码改坏看会不会红（断言是不是恒真）
+
+pm-ask/                             可选配套技能，给执行者用
+├── SKILL.md                        何时呼叫云端 PM、回复怎么处理、不许做什么
+└── scripts/pm-ask.cjs              呼叫 Notion 云端 PM（blocked / merge / review）
 
 tests/selftest.cjs                  脚本自测（node tests/selftest.cjs，31 项）
 tests/pm-ask.test.cjs               pm-ask 离线自测（假 Notion 接口，node tests/pm-ask.test.cjs，19 项）
