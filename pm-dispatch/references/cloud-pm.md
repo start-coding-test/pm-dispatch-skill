@@ -7,7 +7,7 @@
 - 云端 PM 看不到本机，也跑不了命令。它只依据 pm-ask 带过去的证据（卡片、台账行、结果文件、git 只读上下文、日志尾部）做判断。**L1/L2/L3 验收仍由主会话照 `acceptance.md` 亲自重跑**，云端 PM 的 `merge` 只算预审。
 - 云端 PM 不合并、不 push。合并、提交仍是 S 类动作，需用户开口。
 
-依据：Notion Agent APIs（公测，`Notion-Version: 2026-03-11`）的 Sessions 接口：`POST /v1/sessions` 新建会话，`GET /v1/sessions/{id}` 轮询，`POST /v1/sessions/{id}/events/query` 读 `agent.message`。会话进入 `requires_action` 时用 `actions: [{action_id, option_id: approve|reject}]` 答复。
+依据：Notion Agent APIs（公测，`Notion-Version: 2026-03-11`）的 Sessions 接口：`POST /v1/sessions` 新建会话（带 `session_id` 则在原会话里续聊），`GET /v1/sessions/{id}` 轮询，`POST /v1/sessions/{id}/events/query` 读 `agent.message`。会话进入 `requires_action` 时用 `actions: [{action_id, option_id: approve|reject}]` 答复。
 
 ## 一次性准备
 
@@ -37,7 +37,7 @@ $r.results | Select-Object id, name
 { "agent_id": "Custom Agent 的 id", "project": "项目名", "project_page": "背景页链接" }
 ```
 
-每次呼叫都是一个新会话（并行的执行者不会抢同一会话），项目记忆靠背景页和 `Decisions` 库延续。
+会话按卡分：同一张卡的多次呼叫续用同一个会话（编号存在 `work/<卡号>/pm-session.json`），云端 PM 能看到自己上次的建议，打回次数也好数；不同的卡各开各的，并行的执行者不会抢同一会话。跨卡的项目记忆靠背景页和 `Decisions` 库。想让某张卡从头来过，执行者加 `--new`，或删掉那个文件。
 
 ## 写卡时加的内容
 
