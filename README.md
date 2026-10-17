@@ -207,7 +207,7 @@ pm-ask/                             可选配套技能，给执行者用
 └── scripts/pm-ask.cjs              呼叫 Notion 云端 PM（blocked / merge / review）
 
 tests/selftest.cjs                  脚本自测（node tests/selftest.cjs，31 项）
-tests/pm-ask.test.cjs               pm-ask 离线自测（假 Notion 接口，node tests/pm-ask.test.cjs，19 项）
+tests/pm-ask.test.cjs               pm-ask 离线自测（假 Notion 接口，node tests/pm-ask.test.cjs，26 项）
 ```
 
 ## 变更（v3，提速 + 修门禁）
