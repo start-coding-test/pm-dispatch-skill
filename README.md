@@ -166,6 +166,14 @@ RESULT cases=2 killed=1 survived=1 wrong_kill=0 skipped=0
 按原始字节备份与还原（BOM、CRLF、非 UTF-8 都安全），Ctrl+C 也会先还原；命令支持带引号的含空格路径。
 `--only M1,M3` 只跑部分，`--keep-backup` 保留备份。退出码：0 全杀掉 / 1 有漏网、红错地方或锚点无效 / 2 用法错、基线不绿或还原失败。
 
+## 可选：云端 PM（Notion Custom Agent）
+
+执行 agent 卡住（`blocked`）、做完申请合并（`merge`）或需要拍板（`review`）时，主动运行 `scripts/pm-ask.cjs` 呼叫常驻 Notion 的云端 PM。脚本自动带上卡片、台账行、结果文件、只读 git 上下文，回复和 JSON 决策块落到本卡 `work/<卡号>/`。只做主动触发，不接 webhook；云端 PM 不合并、不提交，验收仍由主会话重跑。需要 Notion Business 及以上和一个个人访问令牌。配置、写卡要加的三行、指令页全文见 [`pm-dispatch/references/cloud-pm.md`](pm-dispatch/references/cloud-pm.md)。
+
+```
+node "$S/scripts/pm-ask.cjs" blocked --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg "卡在哪、试过什么"
+```
+
 ## 在构建链中的位置
 
 ```
@@ -184,14 +192,17 @@ pm-dispatch/
 ├── references/acceptance.md        验收手册：L1/L2/L3 分级、机械核对/变异抽查、现场红五类分法、打回卡怎么写
 ├── references/discipline.md        跨批次纪律：基线与行号漂移、权限现实、执行者纠正 PM、卡片粒度
 ├── references/known-pitfalls.md    踩坑库（Shell/Node/权限/进程/断言与判据/执行会话/同工作树多卡/Git/弱模型特征）
+├── references/cloud-pm.md          可选：Notion 云端 PM 的配置、写卡附加条款、指令页
 └── scripts/
     ├── lib/card.cjs                卡片解析公共部分（代码块感知的小节切分、卡头字段、白名单路径）
     ├── check-cards.cjs             派发前门禁：占位符、缺小节、越界命令、绝对路径、依赖环、白名单重叠
     ├── dispatch.cjs                调度：status / next（生成启动语）
     ├── audit-assertions.cjs        回传后核对：断言标题消失、次数变少、新增 skip/only
-    └── mutate-check.cjs            回传后核对：把代码改坏看会不会红（断言是不是恒真）
+    ├── mutate-check.cjs            回传后核对：把代码改坏看会不会红（断言是不是恒真）
+    └── pm-ask.cjs                  可选：执行者主动呼叫 Notion 云端 PM（blocked / merge / review）
 
 tests/selftest.cjs                  脚本自测（node tests/selftest.cjs，31 项）
+tests/pm-ask.test.cjs               pm-ask 离线自测（假 Notion 接口，node tests/pm-ask.test.cjs，19 项）
 ```
 
 ## 变更（v3，提速 + 修门禁）
