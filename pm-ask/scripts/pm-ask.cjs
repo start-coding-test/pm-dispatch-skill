@@ -6,7 +6,8 @@
 //   node pm-ask.cjs blocked --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg "卡在哪、试过什么"
 //   node pm-ask.cjs merge   --dispatch "..." --task A02 [--base main] [--log "日志绝对路径"]
 //   node pm-ask.cjs review  --dispatch "..." --task B04 --msg-file "说明文件绝对路径"
-// 可选: --timeout 分钟（默认 15）
+// 可选: --timeout 分钟（默认 15）；--new 强制新开会话
+// 会话: 同一张卡默认续用上次的会话（编号存 work/<卡号>/pm-session.json），不同的卡各用各的；续不上时自动新开。
 //
 // 读取: 环境变量 NOTION_API_KEY（个人访问令牌）；<dispatch>/cloud-pm.json:
 //   { "agent_id": "...", "project": "项目名", "project_page": "Notion 项目背景页链接" }
@@ -24,7 +25,7 @@ const POLL_MS = Number(process.env.PM_ASK_POLL_MS) || 4000;
 const TYPES = { blocked: '卡住求助', merge: '申请合并/放行', review: '请 PM 拍板' };
 
 function fail(code, msg) { console.error('[pm-ask] ' + msg); process.exit(code); }
-const usage = (m) => fail(2, m + '\n用法: node pm-ask.cjs blocked|merge|review --dispatch 绝对路径 --task 卡号 [--msg 文本 | --msg-file 路径] [--log 路径] [--base 分支] [--timeout 分钟]');
+const usage = (m) => fail(2, m + '\n用法: node pm-ask.cjs blocked|merge|review --dispatch 绝对路径 --task 卡号 [--msg 文本 | --msg-file 路径] [--log 路径] [--base 分支] [--timeout 分钟] [--new]');
 const tail = (s, n) => (s && s.length > n ? '…（前文截断）\n' + s.slice(-n) : s || '');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -35,6 +36,7 @@ function parseArgs(argv) {
   for (let i = 0; i < rest.length; i++) {
     const k = rest[i];
     if (!k.startsWith('--')) usage(`无法识别的参数：${k}`);
+    if (k === '--new') { o.new = true; continue; }
     const v = rest[i + 1];
     if (v === undefined || v.startsWith('--')) usage(`${k} 缺少取值`);
     o[k.slice(2)] = v; i++;
@@ -74,7 +76,7 @@ function findCard(dir, task) {
   return hit ? path.join(cards, hit) : '';
 }
 
-async function api(method, p, body) {
+async function api(method, p, body, opts = {}) {
   const token = process.env.NOTION_API_KEY;
   for (let attempt = 0; attempt < 4; attempt++) {
     let r;
@@ -93,6 +95,7 @@ async function api(method, p, body) {
       await sleep(ra > 0 ? ra * 1000 : 2000 * (attempt + 1)); continue;
     }
     const j = await r.json().catch(() => ({}));
+    if (!r.ok && opts.soft && [400, 404, 409].includes(r.status)) return null;
     if (!r.ok) fail(1, `${method} ${p} -> ${r.status} ${j.code || ''} ${j.message || ''}`.trim());
     return j;
   }
@@ -149,16 +152,49 @@ async function main() {
     card && `任务卡 ${path.basename(cardPath)}：\n${card}`,
   ].filter(Boolean).join('\n\n').slice(0, 10000);
 
-  const s = await api('POST', '/sessions', {
-    agent_id: cfg.agent_id,
-    message,
-    metadata: { type: o.type, task: o.task, feature, project: String(cfg.project || feature), branch: g ? g.branch : '' },
-    ...(promptContext ? { prompt_context: promptContext } : {}),
-  });
-  console.error(`[pm-ask] 已呼叫云端 PM，session ${s.id}，等待回复…`);
+  const out = path.join(dir, 'work', o.task);
+  const sessFile = path.join(out, 'pm-session.json');
+  let prev = null;
+  if (!o.new) { try { prev = JSON.parse(fs.readFileSync(sessFile, 'utf8')); } catch { prev = null; } }
+
+  let s = null;
+  let afterSeq = -1;
+  if (prev && prev.session_id) {
+    // 续聊：卡片与背景页已在首轮的 prompt_context 里，这里只发新消息
+    s = await api('POST', '/sessions', { session_id: prev.session_id, message }, { soft: true });
+    if (s) { afterSeq = Number(prev.last_sequence) || -1; console.error(`[pm-ask] 续用本卡会话 ${s.id}，等待回复…`); }
+    else console.error(`[pm-ask] 上次的会话 ${prev.session_id} 已不可用，改为新开`);
+  }
+  if (!s) {
+    s = await api('POST', '/sessions', {
+      agent_id: cfg.agent_id,
+      message,
+      metadata: { type: o.type, task: o.task, feature, project: String(cfg.project || feature), branch: g ? g.branch : '' },
+      ...(promptContext ? { prompt_context: promptContext } : {}),
+    });
+    console.error(`[pm-ask] 已新开会话 ${s.id}，等待回复…`);
+  }
+  fs.mkdirSync(out, { recursive: true });
+  const saveSession = (seq) => fs.writeFileSync(sessFile, JSON.stringify({ session_id: s.id, last_sequence: seq, updated: new Date().toISOString() }, null, 2) + '\n');
+  saveSession(afterSeq);
+
+  async function newReplies() {
+    const got = [];
+    let cursor = null;
+    do {
+      const r = await api('POST', `/sessions/${s.id}/events/query`, {
+        filter: { property: 'type', event_type: { equals: 'agent.message' } },
+        ...(cursor ? { start_cursor: cursor } : {}),
+      });
+      got.push(...(r.results || []));
+      cursor = r.has_more ? r.next_cursor : null;
+    } while (cursor);
+    return got.filter((m) => m.sequence > afterSeq).sort((a, b) => a.sequence - b.sequence);
+  }
 
   const deadline = Date.now() + (Number(o.timeout) || 15) * 60000;
   let cur = s;
+  let msgs = [];
   while (Date.now() < deadline) {
     await sleep(POLL_MS);
     cur = await api('GET', `/sessions/${s.id}`);
@@ -168,28 +204,20 @@ async function main() {
       await api('POST', '/sessions', { session_id: s.id, actions: acts });
       continue;
     }
-    if (!['queued', 'in_progress'].includes(cur.status)) break;
+    if (['queued', 'in_progress'].includes(cur.status)) continue;
+    if (cur.status !== 'completed') break;
+    msgs = await newReplies();
+    if (msgs.length) break; // 续聊时状态可能还停在上一轮的 completed，要等到本轮的新回复
   }
   if (cur.status !== 'completed') fail(1, `会话未完成：${cur.status}${cur.error ? ' ' + cur.error.message : ''}（session ${s.id}）`);
+  if (!msgs.length) fail(1, `等到超时也没有本轮的新回复（session ${s.id}）`);
 
-  const msgs = [];
-  let cursor = null;
-  do {
-    const r = await api('POST', `/sessions/${s.id}/events/query`, {
-      filter: { property: 'type', event_type: { equals: 'agent.message' } },
-      ...(cursor ? { start_cursor: cursor } : {}),
-    });
-    msgs.push(...(r.results || []));
-    cursor = r.has_more ? r.next_cursor : null;
-  } while (cursor);
-  msgs.sort((a, b) => a.sequence - b.sequence);
   const last = msgs[msgs.length - 1];
   const text = last ? (last.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('') : '';
   if (!text) fail(1, `会话完成但没有 agent.message（session ${s.id}）`);
   console.log(text);
 
-  const out = path.join(dir, 'work', o.task);
-  fs.mkdirSync(out, { recursive: true });
+  saveSession(last.sequence);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   fs.writeFileSync(path.join(out, `pm-reply-${stamp}.md`), `<!-- session ${s.id} -->\n${text}\n`);
   const blocks = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
