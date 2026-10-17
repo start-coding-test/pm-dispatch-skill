@@ -9,7 +9,7 @@ const path = require('path');
 const http = require('http');
 const { spawn } = require('child_process');
 
-const SCRIPT = path.join(__dirname, '..', 'pm-dispatch', 'scripts', 'pm-ask.cjs');
+const SCRIPT = path.join(__dirname, '..', 'pm-ask', 'scripts', 'pm-ask.cjs');
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'pm ask selftest '));
 const D = path.join(ROOT, '.dispatch', 'demo');
 let pass = 0, fail = 0;
