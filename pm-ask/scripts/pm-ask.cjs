@@ -22,7 +22,7 @@
 //   node pm-ask.cjs review  --dispatch "..." --task B04 --msg-file "说明文件绝对路径"
 // 可选: --timeout 分钟（默认 15）；--new 强制新开会话
 //
-// 读取: 环境变量 NOTION_TOKEN_V2（必需）、NOTION_PM_MODEL（可选，默认 auto）、
+// 读取: 环境变量 NOTION_TOKEN_V2（必需）、NOTION_PM_MODEL（可选，默认 claude-sonnet5.5）、
 //       PM_ASK_PYTHON（可选，默认 python，指向 python.exe）；
 //       <dispatch>/cloud-pm.json: { "project": "项目名", "project_page": "Notion 项目背景页链接" }
 //   自动附带：卡片 cards/<卡号>*.md、results/<卡号>.md（若有）、ledger.md 中本卡那一行、只读 git 上下文。

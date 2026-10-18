@@ -20,6 +20,7 @@ P="$(ls -d "$HOME/.agents/skills/pm-ask" "$HOME/.qoder-cn/skills/pm-ask" "$HOME/
 - 功能目录 `.dispatch/功能名/` 下有 `cloud-pm.json`。没有就说明本功能没开云端 PM：照卡片原规矩记 `BLOCKED` 后停止，不要运行脚本。
 - 环境变量 `NOTION_TOKEN_V2` 已设（浏览器 Cookie 里的 token_v2；脚本直连 Notion、走账号的个人 agent「云端PM」，不需要本地反代）。没设脚本会退出码 2，同样记 `BLOCKED`。若提示 token 过期（401），让用户重新取一次。
 - 机器上有 `python`（PATH 中，3.10+）且已装 `requests`、`curl_cffi`。脚本的 HTTP 请求经它完成（Notion 会拒绝 Node/裸 requests 的 TLS 指纹，返回 `400 UserValidationError`）。自检一行：`python -c "import requests, curl_cffi"` 无报错即可；缺依赖时脚本退出码 2，记 `BLOCKED`。
+- PM 默认用 `claude-sonnet5.5`。要换模型设环境变量 `NOTION_PM_MODEL`（传 `auto` 让账号 agent 自选）；账号不支持所选模型时脚本会自动摘掉 model 以 Auto 重试。
 
 ## 什么时候呼叫
 

@@ -2,7 +2,8 @@
 
 - stdin : 完整 prompt（UTF-8，含证据与本卡历史）
 - env   : NOTION_TOKEN_V2（必需）
-          NOTION_PM_MODEL（可选，默认 auto —— 让账号 agent 自选模型）
+          NOTION_PM_MODEL（可选，默认 claude-sonnet5.5；设为 auto 让账号 agent 自选；
+          账号不支持所选模型时 notion_direct 会自动摘掉 model 以 Auto 重试）
           NOTION_URL / NOTION_PROXY / NOTION_CLIENT_VERSION（可选，透传给 notion_direct）
 - stdout: 纯文本回复（UTF-8）
 - stderr: 诊断信息（含 thread_id=<uuid> 一行，供 cjs 记账）
@@ -45,7 +46,7 @@ def main() -> int:
         user_id=acct["user_id"],
         runtime="agent_service",
     )
-    model = (os.environ.get("NOTION_PM_MODEL") or "auto").strip() or "auto"
+    model = (os.environ.get("NOTION_PM_MODEL") or "claude-sonnet5.5").strip() or "claude-sonnet5.5"
     try:
         result = client.chat(prompt, model=model)
     except NotionUpstreamError as exc:
