@@ -1,33 +1,45 @@
 #!/usr/bin/env node
 'use strict';
-// pm-ask：执行 agent 主动呼叫 Notion 云端 PM（Custom Agent，Agent APIs 公测）。配套技能 pm-ask 的脚本；PM 侧配置见 pm-dispatch/references/cloud-pm.md。
+// pm-ask v2.1：执行 agent 主动呼叫 Notion 云端 PM —— 直连方案（python 指纹通道）。
+//
+// 相对 v1（官方 Agent API）的变更:
+//   * 请求通道: api.notion.com/v1（NOTION_API_KEY + agent_id）
+//              → app.notion.com 私有接口直连: createAgentThread + listenToThreadTranscript，
+//                走账号的个人 agent（本账号为「云端PM」）。
+//   * 传输: Node 原生 fetch 的 TLS 指纹会被 Notion AI 端点拒绝
+//           （400 UserValidationError / generic_error，2026-10 实机确认），
+//           故 HTTP 调用经 python 子进程完成（scripts/pm-ask-turn.py + notion_direct.py，
+//           curl_cffi Chrome 指纹）；本文件只负责证据组装、本地历史与文件读写。
+//   * 凭据: NOTION_API_KEY(ntn_) → 环境变量 NOTION_TOKEN_V2（浏览器 Cookie 里的 token_v2）。
+//   * 续聊: 服务端 session_id → 本地历史续接（pm-session.json 存 exchanges，摊平成
+//     <conversation_history> 放进下一轮 prompt）。v1 的旧会话文件不迁移，自动新开。
+//   * 退出码 3（PM 等批准）不再存在: 0 拿到回复 / 1 接口失败 / 2 用法或配置错误。
+//   * cloud-pm.json 仅用 project / project_page；agent_id 不再使用。
 //
 // 用法:
 //   node pm-ask.cjs blocked --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg "卡在哪、试过什么"
 //   node pm-ask.cjs merge   --dispatch "..." --task A02 [--base main] [--log "日志绝对路径"]
 //   node pm-ask.cjs review  --dispatch "..." --task B04 --msg-file "说明文件绝对路径"
 // 可选: --timeout 分钟（默认 15）；--new 强制新开会话
-// 会话: 同一张卡默认续用上次的会话（编号存 work/<卡号>/pm-session.json），不同的卡各用各的；续不上时自动新开。
 //
-// 读取: 环境变量 NOTION_API_KEY（个人访问令牌）；<dispatch>/cloud-pm.json:
-//   { "agent_id": "...", "project": "项目名", "project_page": "Notion 项目背景页链接" }
+// 读取: 环境变量 NOTION_TOKEN_V2（必需）、NOTION_PM_MODEL（可选，默认 auto）、
+//       PM_ASK_PYTHON（可选，默认 python，指向 python.exe）；
+//       <dispatch>/cloud-pm.json: { "project": "项目名", "project_page": "Notion 项目背景页链接" }
 //   自动附带：卡片 cards/<卡号>*.md、results/<卡号>.md（若有）、ledger.md 中本卡那一行、只读 git 上下文。
-// 写入: 只写 <dispatch>/work/<卡号>/pm-reply-<时间戳>.md 与 .json（在本卡白名单内）。
-// 退出码: 0 拿到回复 / 1 接口或会话失败 / 2 用法或配置错误 / 3 PM 等待批准而当前不是交互终端
+// 写入: 只写 <dispatch>/work/<卡号>/pm-reply-<时间戳>.md 与 .json、pm-session.json（在本卡白名单内）。
+// 依赖: Node 内置 + python（PATH 中，3.10+）且已装 requests、curl_cffi。
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
-const API = (process.env.NOTION_API_BASE || 'https://api.notion.com').replace(/\/$/, '') + '/v1';
-const VERSION = '2026-03-11';
-const POLL_MS = Number(process.env.PM_ASK_POLL_MS) || 4000;
 const TYPES = { blocked: '卡住求助', merge: '申请合并/放行', review: '请 PM 拍板' };
+const HISTORY_MAX_EXCHANGES = 2;
+const HISTORY_ITEM_MAX = 8000;
 
 function fail(code, msg) { console.error('[pm-ask] ' + msg); process.exit(code); }
 const usage = (m) => fail(2, m + '\n用法: node pm-ask.cjs blocked|merge|review --dispatch 绝对路径 --task 卡号 [--msg 文本 | --msg-file 路径] [--log 路径] [--base 分支] [--timeout 分钟] [--new]');
 const tail = (s, n) => (s && s.length > n ? '…（前文截断）\n' + s.slice(-n) : s || '');
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function parseArgs(argv) {
   const [type, ...rest] = argv;
@@ -76,53 +88,84 @@ function findCard(dir, task) {
   return hit ? path.join(cards, hit) : '';
 }
 
-async function api(method, p, body, opts = {}) {
-  const token = process.env.NOTION_API_KEY;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    let r;
-    try {
-      r = await fetch(API + p, {
-        method,
-        headers: { Authorization: `Bearer ${token}`, 'Notion-Version': VERSION, 'Content-Type': 'application/json' },
-        body: body ? JSON.stringify(body) : undefined,
-      });
-    } catch (e) {
-      if (attempt === 3) fail(1, `${method} ${p} 网络错误：${e.message}`);
-      await sleep(1000 * (attempt + 1)); continue;
-    }
-    if ([429, 500, 503, 504, 529].includes(r.status) && attempt < 3) {
-      const ra = Number(r.headers.get('retry-after'));
-      await sleep(ra > 0 ? ra * 1000 : 2000 * (attempt + 1)); continue;
-    }
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok && opts.soft && [400, 404, 409].includes(r.status)) return null;
-    if (!r.ok) fail(1, `${method} ${p} -> ${r.status} ${j.code || ''} ${j.message || ''}`.trim());
-    return j;
+// --- 直连层（python 子进程，curl_cffi Chrome 指纹） ---------------------------
+
+// 把本地历史 + 本轮消息摊平成一条 agent 消息（与 notion_direct 的 _transcript_to_agent_prompt 同格式）
+function buildPrompt(message, promptContext, exchanges) {
+  const latest = [message, promptContext].filter(Boolean).join('\n\n').slice(0, 10000);
+  if (!exchanges || !exchanges.length) return latest;
+  const lines = ['<conversation_history>'];
+  for (const ex of exchanges) {
+    lines.push(`[User]\n${ex.user}\n`);
+    lines.push(`[Assistant]\n${ex.assistant}\n`);
   }
+  lines.push('</conversation_history>\n');
+  lines.push('Continue the conversation above. Reply only to this latest user message:\n');
+  lines.push(latest);
+  return lines.join('\n');
 }
 
-async function askApproval(actions) {
-  if (!process.stdin.isTTY) return null;
-  const readline = require('readline/promises');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-  const out = [];
-  for (const a of actions) {
-    const ans = await rl.question(`[pm-ask] PM 请求批准：${a.title}  批准？(y/N) `);
-    out.push({ action_id: a.action_id, option_id: /^y/i.test(ans.trim()) ? 'approve' : 'reject' });
-  }
-  rl.close();
-  return out;
+function runTurnViaPython(prompt, deadlineMs) {
+  return new Promise((resolve, reject) => {
+    const helper = path.join(__dirname, 'pm-ask-turn.py');
+    if (!fs.existsSync(helper)) {
+      const e = new Error(`缺少内层助手 ${helper}`);
+      e.configError = true;
+      reject(e);
+      return;
+    }
+    const py = process.env.PM_ASK_PYTHON || 'python';
+    let child;
+    try {
+      child = spawn(py, [helper], { stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) {
+      e.configError = true;
+      e.message = `无法启动 ${py}：${e.message}（可用 PM_ASK_PYTHON 指定 python.exe）`;
+      reject(e);
+      return;
+    }
+
+    let out = '';
+    let err = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* noop */ }
+      finish(() => reject(new Error('等待 PM 回复超时（--timeout 可调）')));
+    }, Math.max(1000, deadlineMs - Date.now()));
+    function finish(fn) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    }
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', (e) => {
+      e.configError = true;
+      e.message = `python 启动失败：${e.message}（可用 PM_ASK_PYTHON 指定 python.exe）`;
+      finish(() => reject(e));
+    });
+    child.on('close', (code) => finish(() => resolve({ code, out, err })));
+    child.stdin.on('error', () => { /* 子进程先退出时忽略 EPIPE */ });
+    child.stdin.write(prompt, 'utf8');
+    child.stdin.end();
+  });
 }
+
+// --- 主流程 ------------------------------------------------------------------
 
 async function main() {
   const o = parseArgs(process.argv.slice(2));
   const dir = path.resolve(o.dispatch);
   if (!fs.existsSync(dir)) usage(`--dispatch 目录不存在：${dir}`);
-  if (!process.env.NOTION_API_KEY) fail(2, '未设置环境变量 NOTION_API_KEY');
+  const token = (process.env.NOTION_TOKEN_V2 || '').trim();
+  if (!token) fail(2, '未设置环境变量 NOTION_TOKEN_V2（浏览器 Cookie 里的 token_v2）');
   const cfgPath = path.join(dir, 'cloud-pm.json');
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { fail(2, `读不到或解析不了 ${cfgPath}`); }
-  if (!cfg.agent_id) fail(2, `${cfgPath} 缺少 agent_id`);
 
   const feature = path.basename(dir);
   const cardPath = findCard(dir, o.task);
@@ -154,80 +197,44 @@ async function main() {
 
   const out = path.join(dir, 'work', o.task);
   const sessFile = path.join(out, 'pm-session.json');
-  let prev = null;
-  if (!o.new) { try { prev = JSON.parse(fs.readFileSync(sessFile, 'utf8')); } catch { prev = null; } }
-
-  let s = null;
-  let afterSeq = -1;
-  if (prev && prev.session_id) {
-    // 续聊：卡片与背景页已在首轮的 prompt_context 里，这里只发新消息
-    s = await api('POST', '/sessions', { session_id: prev.session_id, message }, { soft: true });
-    if (s) { afterSeq = Number(prev.last_sequence) || -1; console.error(`[pm-ask] 续用本卡会话 ${s.id}，等待回复…`); }
-    else console.error(`[pm-ask] 上次的会话 ${prev.session_id} 已不可用，改为新开`);
-  }
-  if (!s) {
-    s = await api('POST', '/sessions', {
-      agent_id: cfg.agent_id,
-      message,
-      metadata: { type: o.type, task: o.task, feature, project: String(cfg.project || feature), branch: g ? g.branch : '' },
-      ...(promptContext ? { prompt_context: promptContext } : {}),
-    });
-    console.error(`[pm-ask] 已新开会话 ${s.id}，等待回复…`);
-  }
-  fs.mkdirSync(out, { recursive: true });
-  const saveSession = (seq) => fs.writeFileSync(sessFile, JSON.stringify({ session_id: s.id, last_sequence: seq, updated: new Date().toISOString() }, null, 2) + '\n');
-  saveSession(afterSeq);
-
-  async function newReplies() {
-    const got = [];
-    let cursor = null;
-    do {
-      const r = await api('POST', `/sessions/${s.id}/events/query`, {
-        filter: { property: 'type', event_type: { equals: 'agent.message' } },
-        ...(cursor ? { start_cursor: cursor } : {}),
-      });
-      got.push(...(r.results || []));
-      cursor = r.has_more ? r.next_cursor : null;
-    } while (cursor);
-    return got.filter((m) => m.sequence > afterSeq).sort((a, b) => a.sequence - b.sequence);
+  let exchanges = [];
+  if (!o.new) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(sessFile, 'utf8'));
+      if (Array.isArray(prev.exchanges)) exchanges = prev.exchanges;
+      else console.error('[pm-ask] 检测到 v1 旧会话文件（官方 API 版），无法迁移，本轮按新会话处理');
+    } catch { /* 无历史，新会话 */ }
   }
 
+  const prompt = buildPrompt(message, promptContext, exchanges);
   const deadline = Date.now() + (Number(o.timeout) || 15) * 60000;
-  let cur = s;
-  let msgs = [];
-  while (Date.now() < deadline) {
-    await sleep(POLL_MS);
-    cur = await api('GET', `/sessions/${s.id}`);
-    if (cur.status === 'requires_action') {
-      const acts = await askApproval(cur.required_actions || []);
-      if (!acts) fail(3, `PM 在等批准（${(cur.required_actions || []).map((a) => a.title).join('；')}），当前不是交互终端。请在 Notion 里打开该会话处理，session ${s.id}`);
-      await api('POST', '/sessions', { session_id: s.id, actions: acts });
-      continue;
-    }
-    if (['queued', 'in_progress'].includes(cur.status)) continue;
-    if (cur.status !== 'completed') break;
-    msgs = await newReplies();
-    if (msgs.length) break; // 续聊时状态可能还停在上一轮的 completed，要等到本轮的新回复
-  }
-  if (cur.status !== 'completed') fail(1, `会话未完成：${cur.status}${cur.error ? ' ' + cur.error.message : ''}（session ${s.id}）`);
-  if (!msgs.length) fail(1, `等到超时也没有本轮的新回复（session ${s.id}）`);
+  console.error(`[pm-ask] 直连云端 PM（经 curl_cffi 指纹通道，${exchanges.length ? `续接 ${exchanges.length} 轮历史` : '新会话'}），等待回复…`);
 
-  const last = msgs[msgs.length - 1];
-  const text = last ? (last.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('') : '';
-  if (!text) fail(1, `会话完成但没有 agent.message（session ${s.id}）`);
+  const turn = await runTurnViaPython(prompt, deadline).catch((e) => fail(e.configError ? 2 : 1, e.message));
+  if (turn.code === 2) fail(2, (turn.err || '').trim() || '内层助手配置错误（退出码 2）');
+  if (turn.code !== 0) fail(1, (turn.err || '').trim() || `内层助手异常退出（退出码 ${turn.code}）`);
+  const text = turn.out;
+  const tm = /thread_id=([0-9a-fA-F-]+)/.exec(turn.err || '');
+  const threadId = tm ? tm[1] : '';
   console.log(text);
 
-  saveSession(last.sequence);
+  fs.mkdirSync(out, { recursive: true });
+  const saved = exchanges
+    .concat([{ user: prompt.slice(-HISTORY_ITEM_MAX), assistant: text.slice(-HISTORY_ITEM_MAX) }])
+    .slice(-HISTORY_MAX_EXCHANGES);
+  fs.writeFileSync(sessFile, JSON.stringify({ thread_id: threadId, type: o.type, task: o.task, updated: new Date().toISOString(), exchanges: saved }, null, 2) + '\n');
+
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  fs.writeFileSync(path.join(out, `pm-reply-${stamp}.md`), `<!-- session ${s.id} -->\n${text}\n`);
+  fs.writeFileSync(path.join(out, `pm-reply-${stamp}.md`), `<!-- thread ${threadId} -->\n${text}\n`);
   const blocks = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
   if (!blocks.length) { console.error('[pm-ask] 回复里没有 JSON 决策块，原文已存 .md'); return; }
   try {
     const decision = JSON.parse(blocks[blocks.length - 1][1]);
     const jp = path.join(out, `pm-reply-${stamp}.json`);
-    fs.writeFileSync(jp, JSON.stringify({ session: s.id, task: o.task, type: o.type, ...decision }, null, 2) + '\n');
+    fs.writeFileSync(jp, JSON.stringify({ thread: threadId, task: o.task, type: o.type, ...decision }, null, 2) + '\n');
     console.error(`[pm-ask] 决策 ${decision.decision || '（未写 decision）'}，已写入 ${jp}`);
   } catch { console.error('[pm-ask] JSON 决策块解析失败，原文已存 .md'); }
 }
 
-main().catch((e) => fail(1, e.stack || String(e)));
+if (require.main === module) main().catch((e) => fail(1, e.stack || String(e)));
+module.exports = { buildPrompt, parseArgs };

@@ -1,77 +1,59 @@
 #!/usr/bin/env node
 'use strict';
-// pm-ask.cjs 的离线自测：本地起一个假的 Notion Sessions API，不需要真实令牌与网络。
+// pm-ask.cjs 的离线自测：在临时技能目录里放一个「桩替身」pm-ask-turn.py 顶替直连网络，
+// 逐项断言退出码、证据组装、按卡续聊与落盘。需要本机有 python（没有则跳过桩替身部分）。
 // 用法: node tests/pm-ask.test.cjs      退出码 0 = 全过
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const http = require('http');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
-const SCRIPT = path.join(__dirname, '..', 'pm-ask', 'scripts', 'pm-ask.cjs');
+const SRC = path.join(__dirname, '..', 'pm-ask', 'scripts', 'pm-ask.cjs');
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'pm ask selftest '));
+const SKILL = path.join(ROOT, 'skill'); // 复刻技能脚本结构：pm-ask.cjs + 桩替身
 const D = path.join(ROOT, '.dispatch', 'demo');
-let pass = 0, fail = 0;
+const LOG = path.join(ROOT, 'prompt.log');
+const PY = process.env.PM_ASK_PYTHON || 'python';
+const STUB_THREAD = '11111111-2222-3333-4444-555555555555';
+let pass = 0, fail = 0, skip = 0;
 function check(name, cond, detail) {
   if (cond) pass++;
   else { fail++; console.log(`FAIL ${name}${detail ? '\n     | ' + String(detail).split('\n').join('\n     | ') : ''}`); }
 }
+const skipped = (name) => { skip++; console.log(`SKIP ${name}`); };
+const readLog = () => { try { return fs.readFileSync(LOG, 'utf8'); } catch { return ''; } };
+const clearLog = () => { fs.rmSync(LOG, { force: true }); };
+const sessFile = (t) => path.join(D, 'work', t, 'pm-session.json');
 
-// ---------- 假 API：每个会话记轮次；续聊的第一次轮询故意返回上一轮的 completed ----------
-let scenario = 'ok';
-const seen = [];
-const sessions = new Map();
-let nextId = 1;
-const reply = (n) => `第${n}轮建议：先修 schema 再重跑。\n\`\`\`json\n{"decision":"fix","reason":"第${n}轮","tasks":[]}\n\`\`\``;
-const server = http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (c) => (body += c));
-  req.on('end', () => {
-    const j = body ? JSON.parse(body) : {};
-    seen.push({ method: req.method, url: req.url, headers: req.headers, body: j });
-    const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
-    if (req.headers.authorization !== 'Bearer test-token') return send(401, { code: 'unauthorized', message: 'bad token' });
-    if (req.method === 'POST' && req.url === '/v1/sessions') {
-      if (j.actions) return send(200, { id: j.session_id, status: 'in_progress' });
-      if (j.session_id) {
-        const st = sessions.get(j.session_id);
-        if (!st) return send(404, { code: 'object_not_found', message: 'session' });
-        st.turns++; st.polls = 0;
-        return send(200, { object: 'session', id: j.session_id, status: 'queued' });
-      }
-      const id = `sess-${nextId++}`;
-      sessions.set(id, { turns: 1, polls: 0 });
-      return send(200, { object: 'session', id, status: 'queued' });
-    }
-    let m = req.url.match(/^\/v1\/sessions\/([^/]+)$/);
-    if (req.method === 'GET' && m) {
-      const st = sessions.get(m[1]);
-      st.polls++;
-      if (scenario === 'action') return send(200, { id: m[1], status: 'requires_action', required_actions: [{ action_id: 'a1', title: '合并 PR', options: [] }] });
-      if (scenario === 'failed') return send(200, { id: m[1], status: 'failed', error: { code: 'x', message: '额度用完', retryable: false } });
-      if (st.turns > 1 && st.polls === 1) return send(200, { id: m[1], status: 'completed' }); // 上一轮的残留状态
-      return send(200, { id: m[1], status: st.polls < 3 ? 'in_progress' : 'completed' });
-    }
-    m = req.url.match(/^\/v1\/sessions\/([^/]+)\/events\/query$/);
-    if (req.method === 'POST' && m) {
-      const st = sessions.get(m[1]);
-      const done = st.polls >= 3 ? st.turns : st.turns - 1;
-      const results = [];
-      for (let n = 1; n <= done; n++) {
-        results.push({ sequence: n * 10 - 1, type: 'agent.message', content: [{ type: 'text', text: `第${n}轮中间消息` }] });
-        results.push({ sequence: n * 10, type: 'agent.message', content: [{ type: 'text', text: reply(n) }] });
-      }
-      return send(200, { results: results.reverse(), has_more: false, next_cursor: null });
-    }
-    send(404, { code: 'object_not_found', message: req.url });
-  });
-});
+// ---------- 桩替身：读 stdin（prompt）落盘 → 按 STUB_MODE 回应 ----------
+// 「第 N 轮」由 prompt 里有没有 <conversation_history> 决定，用来断言续聊真的注入了历史。
+const STUB = `# -*- coding: utf-8 -*-
+import os, sys
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+prompt = sys.stdin.read()
+log = os.environ.get("STUB_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(prompt + "\\n=====PROMPT-END=====\\n")
+mode = os.environ.get("STUB_MODE", "ok")
+if mode == "exit2":
+    print("[pm-ask-turn] 桩替身：模拟配置错误", file=sys.stderr)
+    sys.exit(2)
+if mode == "exit1":
+    print("[pm-ask-turn] 上游错误: HTTP 401 UserValidationError", file=sys.stderr)
+    sys.exit(1)
+n = 2 if "<conversation_history>" in prompt else 1
+print("[pm-ask-turn] thread_id=${STUB_THREAD} hist=%s len=%d" % (n == 2, len(prompt)), file=sys.stderr)
+print('第%d轮建议：先修 schema 再重跑。\\n\\n\`\`\`json\\n{"decision":"fix","reason":"第%d轮","tasks":[]}\\n\`\`\`' % (n, n))
+`;
 
 function run(args, env = {}) {
   return new Promise((resolve) => {
-    const p = spawn(process.execPath, [SCRIPT, ...args], {
-      env: { ...process.env, NOTION_API_BASE: `http://127.0.0.1:${server.address().port}`, PM_ASK_POLL_MS: '20', NOTION_API_KEY: 'test-token', ...env },
+    const p = spawn(process.execPath, [path.join(SKILL, 'pm-ask.cjs'), ...args], {
+      env: { ...process.env, NOTION_TOKEN_V2: 'test-token', STUB_LOG: LOG, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
@@ -80,11 +62,11 @@ function run(args, env = {}) {
     p.on('close', (rc) => resolve({ rc, out }));
   });
 }
-const creates = () => seen.filter((x) => x.method === 'POST' && x.url === '/v1/sessions' && !x.body.actions);
-const sessFile = (t) => path.join(D, 'work', t, 'pm-session.json');
 
 (async () => {
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  fs.mkdirSync(SKILL, { recursive: true });
+  fs.copyFileSync(SRC, path.join(SKILL, 'pm-ask.cjs'));
+  fs.writeFileSync(path.join(SKILL, 'pm-ask-turn.py'), STUB);
   fs.mkdirSync(path.join(D, 'cards'), { recursive: true });
   fs.mkdirSync(path.join(D, 'results'), { recursive: true });
   fs.writeFileSync(path.join(D, 'cards', 'T03-schema.md'), '# T03 schema 单测\n卡片正文');
@@ -92,7 +74,7 @@ const sessFile = (t) => path.join(D, 'work', t, 'pm-session.json');
   fs.writeFileSync(path.join(D, 'ledger.md'), '| 卡 | 标题 |\n|----|----|\n| T03 | schema 单测 | 无 | 执行中 | |\n| T30 | 别的卡 | 无 | 待派 | |\n');
   const base = ['--dispatch', D, '--task', 'T03'];
 
-  // ---------- 参数与配置 ----------
+  // ---------- 参数与配置（不依赖 python） ----------
   let r = await run(['nope', ...base]);
   check('未知类型 → 退出码 2', r.rc === 2, r.out);
   r = await run(['blocked', '--dispatch', D]);
@@ -102,72 +84,72 @@ const sessFile = (t) => path.join(D, 'work', t, 'pm-session.json');
   r = await run(['blocked', ...base]);
   check('缺 cloud-pm.json → 退出码 2', r.rc === 2 && /cloud-pm\.json/.test(r.out), r.out);
 
-  fs.writeFileSync(path.join(D, 'cloud-pm.json'), JSON.stringify({ agent_id: 'agent-1', project: '演示', project_page: 'https://www.notion.so/demo' }));
-  r = await run(['blocked', ...base, '--msg', 'x'], { NOTION_API_KEY: '' });
-  check('缺令牌 → 退出码 2', r.rc === 2, r.out);
-  r = await run(['blocked', ...base, '--msg', 'x'], { NOTION_API_KEY: 'wrong' });
-  check('令牌错误 → 退出码 1 并带接口错误码', r.rc === 1 && /401 unauthorized/.test(r.out), r.out);
+  fs.writeFileSync(path.join(D, 'cloud-pm.json'), JSON.stringify({ project: '演示', project_page: 'https://www.notion.so/demo' }));
+  r = await run(['blocked', ...base, '--msg', 'x'], { NOTION_TOKEN_V2: '' });
+  check('缺令牌 → 退出码 2', r.rc === 2 && /NOTION_TOKEN_V2/.test(r.out), r.out);
+  r = await run(['blocked', ...base, '--msg', 'x'], { PM_ASK_PYTHON: 'definitely_not_exist_cmd' });
+  check('python 不存在 → 退出码 2 且报启动失败', r.rc === 2 && /python 启动失败/.test(r.out), r.out);
 
-  // ---------- 首次呼叫：新开会话 ----------
-  seen.length = 0;
+  const hasPython = spawnSync(PY, ['-c', 'pass'], { stdio: 'ignore' }).status === 0;
+  if (!hasPython) {
+    for (const name of ['首次呼叫', '按卡续聊', '--new 重置', '跨卡隔离', '助手失败路径']) skipped(name + '（本机没有 python）');
+    fs.rmSync(ROOT, { recursive: true, force: true });
+    console.log(`pm-ask 自测：${pass} 过，${fail} 挂，${skip} 跳过`);
+    process.exit(fail ? 1 : 0);
+  }
+
+  // ---------- 首次呼叫（merge）：证据组装与落盘 ----------
+  clearLog();
   r = await run(['merge', ...base, '--msg', '自测全绿']);
   check('首次呼叫 → 退出码 0', r.rc === 0, r.out);
-  check('打印本轮最后一条 agent.message', r.out.includes('第1轮建议') && !r.out.includes('中间消息'), r.out);
-  const c1 = creates()[0];
-  check('带 Notion-Version 头', c1 && c1.headers['notion-version'] === '2026-03-11');
-  check('新开会话：带 agent_id 与 metadata，不带 session_id', c1 && c1.body.agent_id === 'agent-1' && !c1.body.session_id && c1.body.metadata.task === 'T03' && c1.body.metadata.type === 'merge', JSON.stringify(c1 && c1.body));
-  check('消息里带台账行且不串到 T30', c1 && c1.body.message.includes('| T03 | schema 单测') && !c1.body.message.includes('T30'));
-  check('merge 时附上结果文件', c1 && c1.body.message.includes('**状态**: DONE'));
-  check('prompt_context 带背景页与卡片', c1 && /notion\.so\/demo/.test(c1.body.prompt_context) && c1.body.prompt_context.includes('卡片正文'));
-  check('message 不超过 10000 字符', c1 && c1.body.message.length <= 10000);
-  const sid1 = fs.existsSync(sessFile('T03')) ? JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8')) : {};
-  check('会话编号与已读序号存进 work/T03/pm-session.json', sid1.session_id === 'sess-1' && sid1.last_sequence === 10, JSON.stringify(sid1));
+  check('打印第1轮回复', r.out.includes('第1轮建议'), r.out);
+  let log = readLog();
+  check('消息头为【merge｜申请合并/放行】', log.includes('【merge｜申请合并/放行】'), log.slice(0, 200));
+  check('带本卡台账行且不串 T30', log.includes('| T03 | schema 单测') && !log.includes('T30'));
+  check('merge 附结果文件', log.includes('**状态**: DONE'));
+  check('卡片与背景页随附', log.includes('卡片正文') && log.includes('notion.so/demo'));
+  check('首次呼叫不带历史包裹', !log.includes('<conversation_history>'));
+  check('单条 prompt 不超过 25000 字符', log.length < 25000, String(log.length));
   const work = path.join(D, 'work', 'T03');
-  let files = fs.readdirSync(work);
-  const jf = files.find((f) => f.endsWith('.json') && f.startsWith('pm-reply-'));
-  check('只写在 work/T03/ 下，md 与 json 各一份', files.filter((f) => f.endsWith('.md')).length === 1 && !!jf, files.join(','));
+  const files = fs.readdirSync(work);
+  const jf = files.find((f) => f.startsWith('pm-reply-') && f.endsWith('.json'));
+  check('只写在 work/T03 下：md+json 各一份', files.filter((f) => f.endsWith('.md')).length === 1 && !!jf, files.join(','));
   const dec = jf ? JSON.parse(fs.readFileSync(path.join(work, jf), 'utf8')) : {};
-  check('JSON 决策块解析正确', dec.decision === 'fix' && dec.session === 'sess-1' && dec.task === 'T03', JSON.stringify(dec));
+  check('JSON 决策块解析正确', dec.decision === 'fix' && dec.thread === STUB_THREAD && dec.task === 'T03', JSON.stringify(dec));
+  const sess1 = JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8'));
+  check('会话文件存 thread_id 与 1 轮历史', sess1.thread_id === STUB_THREAD && sess1.exchanges.length === 1, JSON.stringify(sess1).slice(0, 300));
 
-  // ---------- 同一张卡第二次：续用原会话 ----------
-  seen.length = 0;
+  // ---------- 同一张卡第二次：本地历史续聊 ----------
+  clearLog();
   r = await run(['blocked', ...base, '--msg', '照做后仍红']);
-  const c2 = creates()[0];
-  check('同卡第二次 → 续用原会话（带 session_id，不带 agent_id）', r.rc === 0 && c2 && c2.body.session_id === 'sess-1' && !c2.body.agent_id, r.out + JSON.stringify(c2 && c2.body));
-  check('续聊不被上一轮残留的 completed 骗：打印的是第2轮回复', r.out.includes('第2轮建议') && !r.out.includes('第1轮建议'), r.out);
-  check('blocked 不附结果文件', c2 && !c2.body.message.includes('**状态**: DONE'));
-  const sid2 = JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8'));
-  check('已读序号推进到第2轮', sid2.session_id === 'sess-1' && sid2.last_sequence === 20, JSON.stringify(sid2));
+  check('第二次呼叫 → 退出码 0 且打印第2轮回复', r.rc === 0 && r.out.includes('第2轮建议') && !r.out.includes('第1轮建议'), r.out);
+  log = readLog();
+  check('续聊：历史包裹注入且含上轮回复', log.includes('<conversation_history>') && log.includes('第1轮建议'));
+  const latest2 = log.split('Reply only to this latest user message:').pop() || '';
+  check('blocked 本轮不附结果文件（历史里保留上轮属预期）', latest2 && !latest2.includes('**状态**: DONE'), latest2.slice(0, 200));
+  const sess2 = JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8'));
+  check('历史累计到 2 轮', sess2.exchanges.length === 2, String(sess2.exchanges.length));
 
-  // ---------- --new 强制新开；不同的卡各开各的 ----------
-  seen.length = 0;
+  // ---------- --new：历史重置 ----------
+  clearLog();
   r = await run(['review', ...base, '--msg', 'x', '--new']);
-  const c3 = creates()[0];
-  check('--new → 新开会话', r.rc === 0 && c3 && c3.body.agent_id && !c3.body.session_id && JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8')).session_id === 'sess-2', r.out);
-  seen.length = 0;
+  check('--new → 第1轮回复（旧历史不带入）', r.rc === 0 && r.out.includes('第1轮建议'), r.out);
+  check('--new 的 prompt 不带历史', !readLog().includes('<conversation_history>'));
+  check('--new 后历史重置为 1 轮', JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8')).exchanges.length === 1);
+
+  // ---------- 另一张卡：各用各的会话 ----------
+  clearLog();
   r = await run(['blocked', '--dispatch', D, '--task', 'T04', '--msg', 'x']);
-  const c4 = creates()[0];
-  check('另一张卡 → 自己新开会话', r.rc === 0 && c4 && !c4.body.session_id && JSON.parse(fs.readFileSync(sessFile('T04'), 'utf8')).session_id === 'sess-3', r.out);
+  check('另一张卡 → 独立会话且为第1轮', r.rc === 0 && r.out.includes('第1轮建议') && fs.existsSync(sessFile('T04')), r.out);
+  check('不串卡：T04 prompt 无 T03 卡片正文', !readLog().includes('卡片正文'));
 
-  // ---------- 原会话续不上：自动新开 ----------
-  fs.writeFileSync(sessFile('T04'), JSON.stringify({ session_id: 'sess-gone', last_sequence: 10 }));
-  seen.length = 0;
-  r = await run(['blocked', '--dispatch', D, '--task', 'T04', '--msg', 'x']);
-  const cs = creates();
-  check('原会话 404 → 自动新开并覆盖记录', r.rc === 0 && cs.length === 2 && cs[0].body.session_id === 'sess-gone' && cs[1].body.agent_id && /改为新开/.test(r.out) && r.out.includes('第1轮建议'), r.out);
+  // ---------- 内层助手失败路径 ----------
+  r = await run(['blocked', ...base, '--msg', 'x'], { STUB_MODE: 'exit1' });
+  check('助手退出 1 → 脚本退出 1 并原样带错误', r.rc === 1 && /上游错误/.test(r.out), r.out);
+  r = await run(['blocked', ...base, '--msg', 'x'], { STUB_MODE: 'exit2' });
+  check('助手退出 2 → 脚本退出 2', r.rc === 2 && /桩替身：模拟配置错误/.test(r.out), r.out);
 
-  // ---------- 待批准与失败 ----------
-  scenario = 'action';
-  seen.length = 0;
-  r = await run(['merge', ...base, '--msg', 'x', '--new']);
-  check('非交互终端遇到待批准 → 退出码 3，不自动批准', r.rc === 3 && /合并 PR/.test(r.out) && !seen.some((x) => x.body && x.body.actions), r.out);
-
-  scenario = 'failed';
-  r = await run(['review', ...base, '--msg', 'x', '--new']);
-  check('会话失败 → 退出码 1 并带原因', r.rc === 1 && /额度用完/.test(r.out), r.out);
-
-  server.close();
   fs.rmSync(ROOT, { recursive: true, force: true });
-  console.log(`pm-ask 自测：${pass} 过，${fail} 挂`);
+  console.log(`pm-ask 自测：${pass} 过，${fail} 挂${skip ? '，' + skip + ' 跳过' : ''}`);
   process.exit(fail ? 1 : 0);
 })();
