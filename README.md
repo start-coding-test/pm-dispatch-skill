@@ -170,7 +170,7 @@ RESULT cases=2 killed=1 survived=1 wrong_kill=0 skipped=0
 
 ## 可选：云端 PM（Notion Custom Agent）
 
-执行 agent 卡住（`blocked`）、做完申请合并（`merge`）或需要拍板（`review`）时，用配套技能 **pm-ask**（`pm-ask/` 目录，装在执行者的客户端）呼叫常驻 Notion 的云端 PM。pm-dispatch 给 PM 用，pm-ask 给执行者用，分开装。脚本自动带上卡片、台账行、结果文件、只读 git 上下文，回复和 JSON 决策块落到本卡 `work/<卡号>/`。只做主动触发，不接 webhook；云端 PM 不合并、不提交，验收仍由主会话重跑。需要 Notion Business 及以上和一个个人访问令牌。PM 侧配置、写卡要加的三行、指令页见 [`pm-dispatch/references/cloud-pm.md`](pm-dispatch/references/cloud-pm.md)；执行者什么时候呼叫、回复怎么处理见 [`pm-ask/SKILL.md`](pm-ask/SKILL.md)。
+执行 agent 卡住（`blocked`）、做完申请合并（`merge`）或需要拍板（`review`）时，用配套技能 **pm-ask**（`pm-ask/` 目录，装在执行者的客户端）呼叫常驻 Notion 的云端 PM。pm-dispatch 给 PM 用，pm-ask 给执行者用，分开装。脚本自动带上卡片、台账行、结果文件、只读 git 上下文，回复和 JSON 决策块落到本卡 `work/<卡号>/`。只做主动触发，不接 webhook；云端 PM 不合并、不提交，验收仍由主会话重跑。需要 Notion Business 及以上；执行侧凭浏览器 Cookie 里的 `token_v2`（环境变量 `NOTION_TOKEN_V2`）直连，另需本机 python 与 `requests`、`curl_cffi`。PM 侧配置、写卡要加的三行、指令页见 [`pm-dispatch/references/cloud-pm.md`](pm-dispatch/references/cloud-pm.md)；执行者什么时候呼叫、回复怎么处理见 [`pm-ask/SKILL.md`](pm-ask/SKILL.md)。
 
 ```
 node "$P/scripts/pm-ask.cjs" blocked --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg "卡在哪、试过什么"
@@ -204,11 +204,23 @@ pm-dispatch/
 
 pm-ask/                             可选配套技能，给执行者用
 ├── SKILL.md                        何时呼叫云端 PM、回复怎么处理、不许做什么
-└── scripts/pm-ask.cjs              呼叫 Notion 云端 PM（blocked / merge / review）
+└── scripts/
+    ├── pm-ask.cjs                  证据组装 / 本地续聊 / 落盘（blocked / merge / review）
+    ├── pm-ask-turn.py              直连内层助手（一个 agent 会话回合，stdin→stdout）
+    └── notion_direct.py            直连 Notion 客户端（curl_cffi Chrome 指纹）
 
 tests/selftest.cjs                  脚本自测（node tests/selftest.cjs，31 项）
-tests/pm-ask.test.cjs               pm-ask 离线自测（假 Notion 接口，node tests/pm-ask.test.cjs，26 项）
+tests/pm-ask.test.cjs               pm-ask 离线自测（桩替身助手，需本机 python，node tests/pm-ask.test.cjs，28 项）
 ```
+
+## 变更（v4，pm-ask 直连版）
+
+- **通道**：pm-ask 不再走 Agent APIs（`api.notion.com/v1/sessions`、PAT、`agent_id`），改为直连 `app.notion.com` 私有接口（`createAgentThread` + `listenToThreadTranscript`），请求落在账号的个人 agent（你建的「云端PM」）。
+- **凭据**：执行侧改用浏览器 Cookie 里的 `token_v2`（环境变量 `NOTION_TOKEN_V2`）；`cloud-pm.json` 不再需要 `agent_id`。
+- **指纹**：Notion 会拒绝 Node / 裸 requests 的 TLS 指纹（`400 UserValidationError` / `generic_error`），HTTP 请求改由 `scripts/pm-ask-turn.py` + `scripts/notion_direct.py`（curl_cffi Chrome 指纹）执行；需本机 python 3.10+ 与 `requests`、`curl_cffi`。
+- **会话**：直连协议每次呼叫在 Notion 新建线程（同卡多轮在侧栏各占一行）；「续聊」改为本地历史重放——`work/<卡号>/pm-session.json` 保存最近 2 轮问答，下一轮摊平成 `<conversation_history>` 随消息发出。
+- **退出码**：不再有 3（直连版没有批准流）：0 拿到回复 ／ 1 接口失败 ／ 2 用法或配置错误。
+- `tests/pm-ask.test.cjs` 改为桩替身方案（28 项，需要本机 python；没有 python 时跳过对应部分）。
 
 ## 变更（v3，提速 + 修门禁）
 
