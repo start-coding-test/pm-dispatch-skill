@@ -1,31 +1,27 @@
 #!/usr/bin/env node
 'use strict';
-// pm-ask v2.1：执行 agent 主动呼叫 Notion 云端 PM —— 直连方案（python 指纹通道）。
+// pm-ask v3（PM ↔ 子 agent 消息协议 v2）：执行 agent 主动呼叫 Notion 云端 PM —— 直连方案。
 //
-// 相对 v1（官方 Agent API）的变更:
-//   * 请求通道: api.notion.com/v1（NOTION_API_KEY + agent_id）
-//              → app.notion.com 私有接口直连: createAgentThread + listenToThreadTranscript，
-//                走账号的个人 agent（本账号为「云端PM」）。
-//   * 传输: Node 原生 fetch 的 TLS 指纹会被 Notion AI 端点拒绝
-//           （400 UserValidationError / generic_error，2026-10 实机确认），
-//           故 HTTP 调用经 python 子进程完成（scripts/pm-ask-turn.py + notion_direct.py，
-//           curl_cffi Chrome 指纹）；本文件只负责证据组装、本地历史与文件读写。
-//   * 凭据: NOTION_API_KEY(ntn_) → 环境变量 NOTION_TOKEN_V2（浏览器 Cookie 里的 token_v2）。
-//   * 续聊: 服务端 session_id → 本地历史续接（pm-session.json 存 exchanges，摊平成
-//     <conversation_history> 放进下一轮 prompt）。v1 的旧会话文件不迁移，自动新开。
-//   * 退出码 3（PM 等批准）不再存在: 0 拿到回复 / 1 接口失败 / 2 用法或配置错误。
-//   * cloud-pm.json 仅用 project / project_page；agent_id 不再使用。
+// 子命令（协议 v2 正式版）:
+//   plan | check | ready | blocked | done | alert
+//   merge  = ready 的别名
+//   review = 过渡期别名：从 --msg/--msg-file 正文第一行的 #R-<类型> 推断类型
 //
+// 协议头由脚本用本地 git 生成（正文若自带 #R- 头会被丢弃并提示）:
+//   #R-<TYPE> 卡=<卡号> 分支=<branch> HEAD=<40位SHA> 基线main=<7位SHA> 时间=<ISO8601>
+//
+// 回复: 终端打印 PM 文本；末尾 JSON 决策块落到 work/<卡号>/pm-reply-*.json（协议 3.1 形状）。
 // 用法:
-//   node pm-ask.cjs blocked --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg "卡在哪、试过什么"
-//   node pm-ask.cjs merge   --dispatch "..." --task A02 [--base main] [--log "日志绝对路径"]
-//   node pm-ask.cjs review  --dispatch "..." --task B04 --msg-file "说明文件绝对路径"
-// 可选: --timeout 分钟（默认 15）；--new 强制新开会话
+//   node pm-ask.cjs plan    --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg-file 计划.md
+//   node pm-ask.cjs ready   --dispatch "..." --task T03 --msg-file 证据包.md        # merge 同义
+//   node pm-ask.cjs blocked --dispatch "..." --task T03 --msg "卡在哪、试过什么"
+// 可选: --timeout 分钟（默认 15）；--new 强制新开会话；--base 基线（默认 origin/main → main → master）
 //
 // 读取: 环境变量 NOTION_TOKEN_V2（必需）、NOTION_PM_MODEL（可选，默认 claude-sonnet5.5）、
 //       PM_ASK_PYTHON（可选，默认 python，指向 python.exe）；
 //       <dispatch>/cloud-pm.json: { "project": "项目名", "project_page": "Notion 项目背景页链接" }
-//   自动附带：卡片 cards/<卡号>*.md、results/<卡号>.md（若有）、ledger.md 中本卡那一行、只读 git 上下文。
+//   自动附带：卡片 cards/<卡号>*.md、results/<卡号>.md（BLOCKED 除外）、ledger.md 本卡那一行、
+//   只读 git 上下文（分支/基线/领先落后/diff --stat/未提交）。
 // 写入: 只写 <dispatch>/work/<卡号>/pm-reply-<时间戳>.md 与 .json、pm-session.json（在本卡白名单内）。
 // 依赖: Node 内置 + python（PATH 中，3.10+）且已装 requests、curl_cffi。
 
@@ -33,17 +29,20 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
-const TYPES = { blocked: '卡住求助', merge: '申请合并/放行', review: '请 PM 拍板' };
+const SUBCOMMANDS = ['plan', 'check', 'ready', 'blocked', 'done', 'alert', 'merge', 'review'];
+const R_FOR = { plan: 'PLAN', check: 'CHECK', ready: 'READY', merge: 'READY', blocked: 'BLOCKED', done: 'DONE', alert: 'ALERT' };
+const R_ALLOWED = new Set(['PLAN', 'CHECK', 'READY', 'BLOCKED', 'DONE', 'ALERT']);
 const HISTORY_MAX_EXCHANGES = 2;
 const HISTORY_ITEM_MAX = 8000;
+const MESSAGE_MAX = 16000;
 
 function fail(code, msg) { console.error('[pm-ask] ' + msg); process.exit(code); }
-const usage = (m) => fail(2, m + '\n用法: node pm-ask.cjs blocked|merge|review --dispatch 绝对路径 --task 卡号 [--msg 文本 | --msg-file 路径] [--log 路径] [--base 分支] [--timeout 分钟] [--new]');
+const usage = (m) => fail(2, m + '\n用法: node pm-ask.cjs plan|check|ready|blocked|done|alert|merge|review --dispatch 绝对路径 --task 卡号 [--msg 文本 | --msg-file 路径] [--log 路径] [--base 基线] [--timeout 分钟] [--new]');
 const tail = (s, n) => (s && s.length > n ? '…（前文截断）\n' + s.slice(-n) : s || '');
 
 function parseArgs(argv) {
   const [type, ...rest] = argv;
-  if (!TYPES[type]) usage(`第一个参数须是 ${Object.keys(TYPES).join(' / ')}`);
+  if (!SUBCOMMANDS.includes(type)) usage(`第一个参数须是 ${SUBCOMMANDS.join(' / ')}`);
   const o = { type };
   for (let i = 0; i < rest.length; i++) {
     const k = rest[i];
@@ -64,11 +63,18 @@ function git(args, cwd) {
   return r.status === 0 ? r.stdout.trim() : '';
 }
 
+function resolveBase(cwd, explicit) {
+  if (explicit) return explicit;
+  for (const ref of ['origin/main', 'main', 'master']) {
+    if (git(['rev-parse', '--verify', '--quiet', ref], cwd)) return ref;
+  }
+  return '';
+}
+
 function gitContext(cwd, base) {
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd);
   if (!branch) return null;
-  let b = base;
-  if (!b) b = ['main', 'master'].find((x) => git(['rev-parse', '--verify', '--quiet', x], cwd)) || '';
+  const b = resolveBase(cwd, base);
   const ctx = { branch, base: b || '（未找到 main/master）', head: git(['log', '-1', '--pretty=%h %s'], cwd), status: tail(git(['status', '--short'], cwd), 800) };
   if (b) {
     ctx.ahead = git(['rev-list', '--count', `${b}..HEAD`], cwd);
@@ -88,11 +94,34 @@ function findCard(dir, task) {
   return hit ? path.join(cards, hit) : '';
 }
 
+// --- 协议 v2：上行类型与 #R 头 ------------------------------------------------
+
+// 正文若自带 "#R-<类型> ..." 头，取其类型并剥离该行（头统一由脚本用本地 git 重生成）
+function splitProtocolBody(note) {
+  const trimmed = (note || '').replace(/^\uFEFF/, '').trim();
+  const m = /^#R-([A-Z]+)\b[^\n]*(?:\n|$)/.exec(trimmed);
+  if (m && R_ALLOWED.has(m[1])) {
+    return { declared: m[1], body: trimmed.slice(m[0].length).trim() };
+  }
+  return { declared: null, body: trimmed };
+}
+
+function buildProtocolHeader(rtype, task, cwd, base) {
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd);
+  const head = git(['rev-parse', 'HEAD'], cwd);
+  const baseRef = resolveBase(cwd, base);
+  const baseShort = baseRef && git(['rev-parse', '--short=7', baseRef], cwd);
+  if (!branch || !/^[0-9a-f]{40}$/.test(head) || !baseShort) {
+    fail(2, '计算 #R 头失败：请在 git 仓库内运行，且存在 origin/main、main 或 master 基线（也可用 --base 指定）');
+  }
+  return `#R-${rtype} 卡=${task} 分支=${branch} HEAD=${head} 基线main=${baseShort} 时间=${new Date().toISOString()}`;
+}
+
 // --- 直连层（python 子进程，curl_cffi Chrome 指纹） ---------------------------
 
 // 把本地历史 + 本轮消息摊平成一条 agent 消息（与 notion_direct 的 _transcript_to_agent_prompt 同格式）
 function buildPrompt(message, promptContext, exchanges) {
-  const latest = [message, promptContext].filter(Boolean).join('\n\n').slice(0, 10000);
+  const latest = [message, promptContext].filter(Boolean).join('\n\n').slice(0, MESSAGE_MAX);
   if (!exchanges || !exchanges.length) return latest;
   const lines = ['<conversation_history>'];
   for (const ex of exchanges) {
@@ -168,32 +197,46 @@ async function main() {
   try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { fail(2, `读不到或解析不了 ${cfgPath}`); }
 
   const feature = path.basename(dir);
+  const projectRoot = path.resolve(dir, '..', '..');
   const cardPath = findCard(dir, o.task);
   const card = cardPath ? readIf(cardPath, 6000) : '';
-  const result = o.type === 'blocked' ? '' : readIf(path.join(dir, 'results', `${o.task}.md`), 3000);
   const ledgerRow = (readIf(path.join(dir, 'ledger.md'), 200000).split('\n').find((l) => new RegExp(`^\\|\\s*${o.task}\\s*\\|`).test(l)) || '').trim();
-  let note = o.msg || '';
-  if (o['msg-file']) { note = readIf(path.resolve(o['msg-file']), 3000); if (!note) usage(`读不到 --msg-file：${o['msg-file']}`); }
+  let rawNote = o.msg || '';
+  if (o['msg-file']) { rawNote = readIf(path.resolve(o['msg-file']), MESSAGE_MAX); if (!rawNote) usage(`读不到 --msg-file：${o['msg-file']}`); }
   const log = o.log ? readIf(path.resolve(o.log), 3000) : '';
-  const projectRoot = path.resolve(dir, '..', '..');
+
+  // 协议类型：正式子命令直接映射；review 从正文 #R-<类型> 推断
+  const { declared, body } = splitProtocolBody(rawNote);
+  let rtype = R_FOR[o.type] || null;
+  if (o.type === 'review') {
+    if (!declared) usage('review 是过渡期别名：正文第一行必须写 #R-<PLAN|CHECK|READY|BLOCKED|DONE|ALERT>，或改用正式子命令 plan|check|ready|blocked|done|alert');
+    rtype = declared;
+    console.error(`[pm-ask] review → #R-${rtype}（过渡期别名）`);
+  } else if (declared && declared !== rtype) {
+    console.error(`[pm-ask] 正文声明的 #R-${declared} 与子命令 ${o.type} 不一致，以子命令为准（#R-${rtype}）`);
+  }
+  if (declared) console.error('[pm-ask] 已丢弃正文自带的 #R 头，改用本地 git 实测值重生成');
+
+  const result = rtype === 'BLOCKED' ? '' : readIf(path.join(dir, 'results', `${o.task}.md`), 3000);
   const g = gitContext(projectRoot, o.base);
+  const rhead = buildProtocolHeader(rtype, o.task, projectRoot, o.base);
 
   const message = [
-    `【${o.type}｜${TYPES[o.type]}】项目「${cfg.project || feature}」功能「${feature}」卡 ${o.task}`,
+    rhead,
+    body || '',
     ledgerRow && `台账行：${ledgerRow}`,
     g && `git：分支 ${g.branch}，基线 ${g.base}${g.ahead !== undefined ? `（领先 ${g.ahead} / 落后 ${g.behind}）` : ''}，最新 ${g.head}`,
-    note && `执行 agent 说明：\n${note}`,
     g && g.stat && `改动统计：\n${g.stat}`,
     g && g.status && `工作树未提交：\n${g.status}`,
     log && `日志尾部：\n${log}`,
     result && `结果文件 results/${o.task}.md：\n${result}`,
-    '请按指令页的输出契约回复，末尾附 JSON 决策块。',
-  ].filter(Boolean).join('\n\n').slice(0, 10000);
+    '请按协议 v2 回复：文本头 + 说明，末尾附一个 JSON 决策块（decision / directive / head_sha / actions / report / tasks）；脚本以该 JSON 块为准。',
+  ].filter(Boolean).join('\n\n').slice(0, MESSAGE_MAX);
 
   const promptContext = [
     cfg.project_page && `项目背景页：${cfg.project_page}`,
     card && `任务卡 ${path.basename(cardPath)}：\n${card}`,
-  ].filter(Boolean).join('\n\n').slice(0, 10000);
+  ].filter(Boolean).join('\n\n').slice(0, MESSAGE_MAX);
 
   const out = path.join(dir, 'work', o.task);
   const sessFile = path.join(out, 'pm-session.json');
@@ -208,7 +251,7 @@ async function main() {
 
   const prompt = buildPrompt(message, promptContext, exchanges);
   const deadline = Date.now() + (Number(o.timeout) || 15) * 60000;
-  console.error(`[pm-ask] 直连云端 PM（经 curl_cffi 指纹通道，${exchanges.length ? `续接 ${exchanges.length} 轮历史` : '新会话'}），等待回复…`);
+  console.error(`[pm-ask] ${rhead.split(' ')[0]} 直连云端 PM（经 curl_cffi 指纹通道，${exchanges.length ? `续接 ${exchanges.length} 轮历史` : '新会话'}），等待回复…`);
 
   const turn = await runTurnViaPython(prompt, deadline).catch((e) => fail(e.configError ? 2 : 1, e.message));
   if (turn.code === 2) fail(2, (turn.err || '').trim() || '内层助手配置错误（退出码 2）');
@@ -219,10 +262,11 @@ async function main() {
   console.log(text);
 
   fs.mkdirSync(out, { recursive: true });
+  // 历史只存本轮 message（不存整个 prompt，避免历史包裹嵌套并把 #R 头挤掉）
   const saved = exchanges
-    .concat([{ user: prompt.slice(-HISTORY_ITEM_MAX), assistant: text.slice(-HISTORY_ITEM_MAX) }])
+    .concat([{ user: message.slice(-HISTORY_ITEM_MAX), assistant: text.slice(-HISTORY_ITEM_MAX) }])
     .slice(-HISTORY_MAX_EXCHANGES);
-  fs.writeFileSync(sessFile, JSON.stringify({ thread_id: threadId, type: o.type, task: o.task, updated: new Date().toISOString(), exchanges: saved }, null, 2) + '\n');
+  fs.writeFileSync(sessFile, JSON.stringify({ thread_id: threadId, type: o.type, r_type: rtype, task: o.task, updated: new Date().toISOString(), exchanges: saved }, null, 2) + '\n');
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   fs.writeFileSync(path.join(out, `pm-reply-${stamp}.md`), `<!-- thread ${threadId} -->\n${text}\n`);
@@ -231,10 +275,15 @@ async function main() {
   try {
     const decision = JSON.parse(blocks[blocks.length - 1][1]);
     const jp = path.join(out, `pm-reply-${stamp}.json`);
-    fs.writeFileSync(jp, JSON.stringify({ thread: threadId, task: o.task, type: o.type, ...decision }, null, 2) + '\n');
-    console.error(`[pm-ask] 决策 ${decision.decision || '（未写 decision）'}，已写入 ${jp}`);
+    fs.writeFileSync(jp, JSON.stringify({ thread: threadId, task: o.task, type: o.type, r_type: rtype, ...decision }, null, 2) + '\n');
+    const acts = Array.isArray(decision.actions) ? decision.actions.map((a) => a && a.do).filter(Boolean) : [];
+    console.error(
+      `[pm-ask] 决策 decision=${decision.decision || '?'} directive=${decision.directive || '?'} ` +
+      `head_sha=${(decision.head_sha || '').slice(0, 7) || '(空)'} report=${decision.report || '?'} ` +
+      `actions=${acts.length ? acts.join(',') : '无'}，已写入 ${jp}`
+    );
   } catch { console.error('[pm-ask] JSON 决策块解析失败，原文已存 .md'); }
 }
 
 if (require.main === module) main().catch((e) => fail(1, e.stack || String(e)));
-module.exports = { buildPrompt, parseArgs };
+module.exports = { buildPrompt, parseArgs, splitProtocolBody };

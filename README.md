@@ -210,8 +210,18 @@ pm-ask/                             可选配套技能，给执行者用
     └── notion_direct.py            直连 Notion 客户端（curl_cffi Chrome 指纹）
 
 tests/selftest.cjs                  脚本自测（node tests/selftest.cjs，31 项）
-tests/pm-ask.test.cjs               pm-ask 离线自测（桩替身助手，需本机 python，node tests/pm-ask.test.cjs，28 项）
+tests/pm-ask.test.cjs               pm-ask 离线自测（桩替身助手，需本机 git/python，node tests/pm-ask.test.cjs，41 项）
 ```
+
+## 变更（v5，pm-ask 协议 v2）
+
+- 子命令改为协议 v2：`plan | check | ready | blocked | done | alert`（`merge` = `ready` 别名；`review` = 过渡别名，正文第一行须写 `#R-<类型>`）。
+- `#R-*` 协议头由脚本用本地 git 生成（分支 / 40 位 HEAD / 7 位基线 main / ISO 时间）；正文自带旧头会被丢弃并按实测值重生成。
+- 消息正文按协议 §2 模板（PLAN/CHECK/READY/BLOCKED/DONE/ALERT），证据要求「一次说全」。
+- 回复以末尾 JSON 决策块为准（`decision` / `directive` / `head_sha` / `actions` / `report` / `tasks`）；`actions` 为封闭词表，`head_sha` 与当前 HEAD 不吻合不执行；允许的 git 操作（rebase、`merge_pr` 等）以 actions 白名单为界。
+- 续聊历史改为只存本轮 message（不再存整个 prompt，避免历史包裹嵌套与 `#R` 头被截断）。
+- 单条消息上限 10000 → 16000 字符。
+- 自测扩到 41 项（需要本机 git 与 python）。
 
 ## 变更（v4，pm-ask 直连版）
 
