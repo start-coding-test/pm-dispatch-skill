@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 // pm-ask.cjs 的离线自测：桩替身 pm-ask-turn.py 顶替直连网络，验证协议 v2 的
-// #R 头、子命令映射、head_sha 校验、旧格式兼容、基线刷新提示、按卡续聊与落盘。
+// #R 头、子命令映射、head_sha 校验、旧格式兼容、基线刷新、card/thread 行、
+// 默认「上轮结论摘要」与 --full-history、按卡续聊与落盘。
 // 需要本机有 git（算 #R 头 / head_sha / fetch）与 python（跑内层助手）；缺任一则跳过对应部分。
 // 用法: node tests/pm-ask.test.cjs      退出码 0 = 全过
 
@@ -32,7 +33,7 @@ const latestReplyJson = (t) => {
   return f ? JSON.parse(fs.readFileSync(path.join(w, f), 'utf8')) : {};
 };
 const HEADER_RE = /^#R-([A-Z]+) 卡=(\S+) 分支=(\S+) HEAD=([0-9a-f]{40}) 基线main=([0-9a-f]{7}) 时间=\S+/;
-// 续聊时 prompt 以 <conversation_history> 开头；取「本轮」那一段再匹配 #R 头
+// --full-history 时 prompt 以 <conversation_history> 开头；取「本轮」那一段再匹配 #R 头
 const latestOf = (log) => {
   const marker = 'Reply only to this latest user message:';
   const i = log.lastIndexOf(marker);
@@ -41,7 +42,7 @@ const latestOf = (log) => {
 const headerOf = (log) => HEADER_RE.exec(latestOf(log));
 
 // ---------- 桩替身：读 stdin（prompt）落盘 → 按 STUB_MODE 回应 ----------
-// 「第 N 轮」由 prompt 里有没有 <conversation_history> 决定；STUB_HEAD_SHA 注入 head_sha；
+// 「第 N 轮」由 prompt 里有没有历史包裹或「上轮 PM 结论」摘要决定；STUB_HEAD_SHA 注入 head_sha；
 // STUB_MODE=array 模拟旧版 tasks 数组回复。
 const STUB = `# -*- coding: utf-8 -*-
 import os, sys
@@ -60,7 +61,7 @@ if mode == "exit2":
 if mode == "exit1":
     print("[pm-ask-turn] 上游错误: HTTP 401 UserValidationError", file=sys.stderr)
     sys.exit(1)
-n = 2 if "<conversation_history>" in prompt else 1
+n = 2 if ("<conversation_history>" in prompt or "上轮 PM 结论" in prompt) else 1
 sha = os.environ.get("STUB_HEAD_SHA", "")
 if mode == "array":
     payload = '[{"id":"A05","goal":"stub"}]'
@@ -126,7 +127,7 @@ function run(args, env = {}) {
 
   const hasPython = spawnSync(PY, ['-c', 'pass'], { stdio: 'ignore' }).status === 0;
   if (!hasGit || !hasPython) {
-    for (const name of ['首次呼叫', '按卡续聊', '--new 重置', '跨卡隔离', '子命令映射', 'review 过渡', 'head_sha 校验', '旧格式兼容', '基线刷新', '助手失败路径']) {
+    for (const name of ['首次呼叫', '默认摘要', '--full-history', '--new 重置', '跨卡隔离', '子命令映射', 'review 过渡', 'head_sha 校验', '旧格式兼容', '基线刷新', '助手失败路径']) {
       skipped(name + '（缺 ' + (!hasGit ? 'git' : 'python') + '）');
     }
     fs.rmSync(ROOT, { recursive: true, force: true });
@@ -134,7 +135,7 @@ function run(args, env = {}) {
     process.exit(fail ? 1 : 0);
   }
 
-  // ---------- 首次呼叫（merge = ready 别名）：协议头、fetch 与证据组装 ----------
+  // ---------- 首次呼叫（merge = ready 别名）：协议头、fetch、card/thread 行与证据 ----------
   clearLog();
   r = await run(['merge', ...base, '--msg', '自测全绿']);
   check('首次呼叫 → 退出码 0', r.rc === 0, r.out);
@@ -142,12 +143,13 @@ function run(args, env = {}) {
   let log = readLog();
   const h1 = headerOf(log);
   check('首行是协议头 #R-READY', !!h1 && h1[1] === 'READY' && h1[2] === 'T03' && h1[3] === 'main', log.slice(0, 160));
-  check('正文在协议头之后', log.indexOf('自测全绿') > (h1 ? h1.index + h1[0].length : 0));
+  check('协议头下一行是 card/thread（首轮 thread=none）', log.includes('card=T03-schema.md thread=none'), log.slice(0, 240));
+  check('正文在 card/thread 行之后', log.indexOf('自测全绿') > log.indexOf('card=T03-schema.md'));
   check('ready 前自动 fetch：基线状态已刷新', log.includes('基线状态：origin/main 已刷新'), log.slice(0, 400));
   check('带本卡台账行且不串 T30', log.includes('| T03 | schema 单测') && !log.includes('T30'));
   check('ready 附结果文件', log.includes('**状态**: DONE'));
-  check('卡片与背景页随附', log.includes('卡片正文') && log.includes('notion.so/demo'));
-  check('首次呼叫不带历史包裹', !log.includes('<conversation_history>'));
+  check('不附带卡片正文与背景页（PM 从 Notion 读）', !log.includes('卡片正文') && !log.includes('notion.so/demo'));
+  check('首次呼叫不带历史包裹与上轮摘要', !log.includes('<conversation_history>') && !log.includes('上轮 PM 结论'));
   check('单条 prompt 不超过 32000 字符', log.length < 32000, String(log.length));
   const work = path.join(D, 'work', 'T03');
   const files = fs.readdirSync(work);
@@ -161,27 +163,39 @@ function run(args, env = {}) {
   check('未给 head_sha → head_sha_match=null', dec.head_sha_match === null && /match=n\/a/.test(r.out), r.out);
   check('终端打印决策摘要含 directive/actions', /directive=FIX/.test(r.out) && /actions=run_gates/.test(r.out), r.out);
   const sess1 = JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8'));
-  check('会话文件存 thread_id、#R 类型与 1 轮历史',
-    sess1.thread_id === STUB_THREAD && sess1.r_type === 'READY' && sess1.exchanges.length === 1,
-    JSON.stringify(sess1).slice(0, 300));
+  check('会话文件存 thread_id、#R 类型、last 摘要与 1 轮历史',
+    sess1.thread_id === STUB_THREAD && sess1.r_type === 'READY' && sess1.exchanges.length === 1 &&
+    sess1.last && sess1.last.directive === 'FIX' && sess1.last.thread_id === STUB_THREAD,
+    JSON.stringify(sess1).slice(0, 400));
 
-  // ---------- 同一张卡第二次：本地历史续聊 ----------
+  // ---------- 同一张卡第二次：默认只带本轮消息 + 上轮结论摘要 ----------
   clearLog();
   r = await run(['blocked', ...base, '--msg', '现象：照做后仍红']);
   check('第二次呼叫 → 退出码 0 且打印第2轮回复', r.rc === 0 && r.out.includes('第2轮建议') && !r.out.includes('第1轮建议'), r.out);
   log = readLog();
   check('blocked 本轮首行为 #R-BLOCKED', /^#R-BLOCKED 卡=T03 /.test(latestOf(log)), latestOf(log).slice(0, 120));
-  check('续聊：历史包裹注入且含上轮回复', log.includes('<conversation_history>') && log.includes('第1轮建议'));
+  check('默认不带历史包裹，改带上一轮结论摘要', !log.includes('<conversation_history>') && log.includes('上轮 PM 结论') && log.includes('directive=FIX'));
+  check('消息头 thread 指向上一轮线程', log.includes(`card=T03-schema.md thread=${STUB_THREAD}`));
+  check('默认 prompt 不随历史膨胀（<8000 字符）', latestOf(log).length < 8000, String(latestOf(log).length));
   const latest2 = log.split('Reply only to this latest user message:').pop() || '';
-  check('blocked 本轮不附结果文件（历史里保留上轮属预期）', latest2 && !latest2.includes('**状态**: DONE'), latest2.slice(0, 200));
+  check('blocked 本轮不附结果文件', latest2 && !latest2.includes('**状态**: DONE'), latest2.slice(0, 200));
   const sess2 = JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8'));
-  check('历史累计到 2 轮', sess2.exchanges.length === 2, String(sess2.exchanges.length));
+  check('历史累计到 2 轮（供 --full-history）', sess2.exchanges.length === 2, String(sess2.exchanges.length));
 
-  // ---------- --new：历史重置 ----------
+  // ---------- --full-history：重放全量历史 ----------
+  clearLog();
+  r = await run(['check', ...base, '--msg', '全量历史测试', '--full-history']);
+  log = readLog();
+  check('--full-history：重放多轮历史包裹', r.rc === 0 && log.includes('<conversation_history>') && log.includes('第1轮建议') && log.includes('第2轮建议'), log.slice(0, 300));
+  check('--full-history：进程提示全量历史', /全量历史 2 轮/.test(r.out), r.out);
+
+  // ---------- --new：历史与摘要重置 ----------
   clearLog();
   r = await run(['check', ...base, '--msg', '完成：x', '--new']);
   check('--new → 第1轮回复（旧历史不带入）', r.rc === 0 && r.out.includes('第1轮建议'), r.out);
-  check('--new 的 prompt 不带历史', !readLog().includes('<conversation_history>'));
+  check('--new 的 prompt 不带历史包裹', !readLog().includes('<conversation_history>'));
+  check('--new 不带上轮结论摘要', !readLog().includes('上轮 PM 结论'));
+  check('--new 后 thread=none', readLog().includes('thread=none'));
   check('--new 后历史重置为 1 轮', JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8')).exchanges.length === 1);
 
   // ---------- 另一张卡：各用各的会话 ----------
@@ -213,7 +227,7 @@ function run(args, env = {}) {
   const hMis = headerOf(readLog());
   check('子命令与正文类型不一致 → 以子命令为准并警告', r.rc === 0 && !!hMis && hMis[1] === 'PLAN' && /不一致/.test(r.out), r.out);
 
-  // ---------- head_sha 校验（≥7 位前缀）与旧格式兼容 ----------
+  // ---------- head_sha 校验（≥7 位前缀）、摘要回带与旧格式兼容 ----------
   const localShort = spawnSync('git', ['-C', ROOT, 'rev-parse', '--short=7', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
   clearLog();
   r = await run(['ready', ...base, '--msg', 'x'], { STUB_HEAD_SHA: localShort });
@@ -224,6 +238,7 @@ function run(args, env = {}) {
   r = await run(['ready', ...base, '--msg', 'x'], { STUB_HEAD_SHA: 'deadbeef' });
   cur = latestReplyJson('T03');
   check('head_sha 不吻合 → head_sha_match=false 且醒目警告', r.rc === 0 && cur.head_sha_match === false && /不吻合/.test(r.out) && /不要执行任何 actions/.test(r.out), r.out);
+  check('上轮结论摘要回带上轮 head_sha', readLog().includes(`head_sha=${localShort}`), readLog().slice(0, 400));
 
   clearLog();
   r = await run(['check', ...base, '--msg', 'x'], { STUB_MODE: 'array' });

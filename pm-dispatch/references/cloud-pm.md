@@ -44,7 +44,7 @@ pm-ask 只写本卡 `work/<卡号>/pm-reply-*.md|json`，在白名单之内；�
 
 ## 执行者怎么用
 
-见 `pm-ask/SKILL.md`（协议 v2 的子命令与上行模板都在那里）。脚本自动附带：卡片 `cards/<卡号>*.md`（随消息一并带上）、`ledger.md` 本卡一行、`merge`/`review` 时的 `results/<卡号>.md`、分支与基线的领先/落后数、`git diff --stat`、未提交文件；单条消息不超过 16000 字符。退出码 0 拿到回复 ／ 1 接口失败 ／ 2 用法或配置错误（直连版没有「等批准」流程）。
+见 `pm-ask/SKILL.md`（协议 v2 的子命令与上行模板都在那里）。消息头带一行 `card=<卡片文件> thread=<上一轮线程|none>`；默认只带本轮模板与上一轮 PM 结论摘要（directive / head_sha / decision），`--full-history` 才重放全量历史；卡片正文与项目背景页不随消息发送（PM 从 Notion 读）。自动附带：`ledger.md` 本卡一行、`ready`/`merge` 时的 `results/<卡号>.md`、分支与基线的领先/落后数、`git diff --stat`、未提交文件、基线状态（ready/check 前自动 fetch）。单条消息不超过 16000 字符。退出码 0 拿到回复 ／ 1 接口失败 ／ 2 用法或配置错误（直连版没有「等批准」流程）。
 
 ## 主会话处理回复
 

@@ -18,13 +18,14 @@
 //   node pm-ask.cjs plan    --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg-file 计划.md
 //   node pm-ask.cjs ready   --dispatch "..." --task T03 --msg-file 证据包.md        # merge 同义
 //   node pm-ask.cjs blocked --dispatch "..." --task T03 --msg "卡在哪、试过什么"
-// 可选: --timeout 分钟（默认 15）；--new 强制新开会话；--base 基线（默认 origin/main → main → master）
+// 可选: --timeout 分钟（默认 15）；--new 强制新开会话；--full-history 重放全量历史；
+//       --base 基线（默认 origin/main → main → master）
 //
-// 读取: 环境变量 NOTION_TOKEN_V2（必需）、NOTION_PM_MODEL（可选，默认 claude-sonnet5.5）、
-//       PM_ASK_PYTHON（可选，默认 python，指向 python.exe）、PM_ASK_NO_FETCH（可选，=1 跳过 git fetch）；
-//       <dispatch>/cloud-pm.json: { "project": "项目名", "project_page": "Notion 项目背景页链接" }
-//   自动附带：卡片 cards/<卡号>*.md、results/<卡号>.md（BLOCKED 除外）、ledger.md 本卡那一行、
-//   只读 git 上下文（分支/基线/领先落后/diff --stat/未提交）。
+// 上下文（默认）: 消息头一行 card=<卡片文件> thread=<上一轮线程|none>；只带本轮模板与
+//   上一轮 PM 结论摘要（directive / head_sha / decision）；--full-history 才重放多轮问答。
+//   卡片正文与项目背景页不随消息发送（PM 从 Notion 读）。
+// 自动附带: results/<卡号>.md（BLOCKED 除外）、ledger.md 本卡那一行、
+//   只读 git 上下文（分支/基线/领先落后/diff --stat/未提交）、基线状态（ready/check 前 fetch）。
 // 写入: 只写 <dispatch>/work/<卡号>/pm-reply-<时间戳>.md 与 .json、pm-session.json（在本卡白名单内）。
 // 依赖: Node 内置 + python（PATH 中，3.10+）且已装 requests、curl_cffi。
 
@@ -40,7 +41,7 @@ const HISTORY_ITEM_MAX = 8000;
 const MESSAGE_MAX = 16000;
 
 function fail(code, msg) { console.error('[pm-ask] ' + msg); process.exit(code); }
-const usage = (m) => fail(2, m + '\n用法: node pm-ask.cjs plan|check|ready|blocked|done|alert|merge|review --dispatch 绝对路径 --task 卡号 [--msg 文本 | --msg-file 路径] [--log 路径] [--base 基线] [--timeout 分钟] [--new]');
+const usage = (m) => fail(2, m + '\n用法: node pm-ask.cjs plan|check|ready|blocked|done|alert|merge|review --dispatch 绝对路径 --task 卡号 [--msg 文本 | --msg-file 路径] [--log 路径] [--base 基线] [--timeout 分钟] [--new] [--full-history]');
 const tail = (s, n) => (s && s.length > n ? '…（前文截断）\n' + s.slice(-n) : s || '');
 
 function parseArgs(argv) {
@@ -51,6 +52,7 @@ function parseArgs(argv) {
     const k = rest[i];
     if (!k.startsWith('--')) usage(`无法识别的参数：${k}`);
     if (k === '--new') { o.new = true; continue; }
+    if (k === '--full-history') { o.fullHistory = true; continue; }
     const v = rest[i + 1];
     if (v === undefined || v.startsWith('--')) usage(`${k} 缺少取值`);
     o[k.slice(2)] = v; i++;
@@ -142,10 +144,10 @@ function buildProtocolHeader(rtype, task, cwd, base) {
 
 // --- 直连层（python 子进程，curl_cffi Chrome 指纹） ---------------------------
 
-// 把本地历史 + 本轮消息摊平成一条 agent 消息（与 notion_direct 的 _transcript_to_agent_prompt 同格式）
-function buildPrompt(message, promptContext, exchanges) {
-  const latest = [message, promptContext].filter(Boolean).join('\n\n').slice(0, MESSAGE_MAX);
-  if (!exchanges || !exchanges.length) return latest;
+// 把历史 + 本轮消息摊平成一条 agent 消息；默认不回放历史，只有 --full-history 才包 <conversation_history>
+function buildPrompt(message, exchanges, fullHistory) {
+  const latest = message.slice(0, MESSAGE_MAX);
+  if (!fullHistory || !exchanges || !exchanges.length) return latest;
   const lines = ['<conversation_history>'];
   for (const ex of exchanges) {
     lines.push(`[User]\n${ex.user}\n`);
@@ -219,10 +221,9 @@ async function main() {
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { fail(2, `读不到或解析不了 ${cfgPath}`); }
 
-  const feature = path.basename(dir);
   const projectRoot = path.resolve(dir, '..', '..');
   const cardPath = findCard(dir, o.task);
-  const card = cardPath ? readIf(cardPath, 6000) : '';
+  const cardLabel = cardPath ? path.basename(cardPath) : o.task;
   const ledgerRow = (readIf(path.join(dir, 'ledger.md'), 200000).split('\n').find((l) => new RegExp(`^\\|\\s*${o.task}\\s*\\|`).test(l)) || '').trim();
   let rawNote = o.msg || '';
   if (o['msg-file']) { rawNote = readIf(path.resolve(o['msg-file']), MESSAGE_MAX); if (!rawNote) usage(`读不到 --msg-file：${o['msg-file']}`); }
@@ -245,11 +246,38 @@ async function main() {
   const g = gitContext(projectRoot, o.base);
   const rhead = buildProtocolHeader(rtype, o.task, projectRoot, o.base);
 
+  const out = path.join(dir, 'work', o.task);
+  const sessFile = path.join(out, 'pm-session.json');
+  let exchanges = [];
+  let lastDecision = null;
+  let prevThreadId = '';
+  if (!o.new) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(sessFile, 'utf8'));
+      if (Array.isArray(prev.exchanges)) exchanges = prev.exchanges;
+      if (prev.last && typeof prev.last === 'object') lastDecision = prev.last;
+      prevThreadId = String(prev.thread_id || (lastDecision && lastDecision.thread_id) || '');
+      if (!Array.isArray(prev.exchanges) && !prev.last) {
+        console.error('[pm-ask] 检测到 v1 旧会话文件（官方 API 版），无法迁移，本轮按新会话处理');
+      }
+    } catch { /* 无历史，新会话 */ }
+  }
+
+  const lastBits = lastDecision ? [
+    lastDecision.directive && `directive=${lastDecision.directive}`,
+    lastDecision.head_sha && `head_sha=${lastDecision.head_sha}`,
+    lastDecision.decision && `decision=${lastDecision.decision}`,
+    lastDecision.r_type && `（上轮 #R-${lastDecision.r_type}）`,
+  ].filter(Boolean).join(' ') : '';
+  const lastLine = lastBits ? `上轮 PM 结论：${lastBits}` : '';
+
   const message = [
     rhead,
+    `card=${cardLabel} thread=${prevThreadId || 'none'}`,
     body || '',
+    lastLine,
     ledgerRow && `台账行：${ledgerRow}`,
-    baselineNote && baselineNote,
+    baselineNote,
     g && `git：分支 ${g.branch}，基线 ${g.base}${g.ahead !== undefined ? `（领先 ${g.ahead} / 落后 ${g.behind}）` : ''}，最新 ${g.head}`,
     g && g.stat && `改动统计：\n${g.stat}`,
     g && g.status && `工作树未提交：\n${g.status}`,
@@ -258,25 +286,10 @@ async function main() {
     '请按协议 v2 回复：文本头 + 说明，末尾附一个 JSON 决策块（decision / directive / head_sha / actions / report / tasks）；脚本以该 JSON 块为准。',
   ].filter(Boolean).join('\n\n').slice(0, MESSAGE_MAX);
 
-  const promptContext = [
-    cfg.project_page && `项目背景页：${cfg.project_page}`,
-    card && `任务卡 ${path.basename(cardPath)}：\n${card}`,
-  ].filter(Boolean).join('\n\n').slice(0, MESSAGE_MAX);
-
-  const out = path.join(dir, 'work', o.task);
-  const sessFile = path.join(out, 'pm-session.json');
-  let exchanges = [];
-  if (!o.new) {
-    try {
-      const prev = JSON.parse(fs.readFileSync(sessFile, 'utf8'));
-      if (Array.isArray(prev.exchanges)) exchanges = prev.exchanges;
-      else console.error('[pm-ask] 检测到 v1 旧会话文件（官方 API 版），无法迁移，本轮按新会话处理');
-    } catch { /* 无历史，新会话 */ }
-  }
-
-  const prompt = buildPrompt(message, promptContext, exchanges);
+  const prompt = buildPrompt(message, exchanges, o.fullHistory);
   const deadline = Date.now() + (Number(o.timeout) || 15) * 60000;
-  console.error(`[pm-ask] ${rhead.split(' ')[0]} 直连云端 PM（经 curl_cffi 指纹通道，${exchanges.length ? `续接 ${exchanges.length} 轮历史` : '新会话'}），等待回复…`);
+  const modeNote = o.fullHistory && exchanges.length ? `全量历史 ${exchanges.length} 轮` : (lastLine ? '上轮结论摘要' : '新会话');
+  console.error(`[pm-ask] ${rhead.split(' ')[0]} 直连云端 PM（经 curl_cffi 指纹通道，${modeNote}），等待回复…`);
 
   const turn = await runTurnViaPython(prompt, deadline).catch((e) => fail(e.configError ? 2 : 1, e.message));
   if (turn.code === 2) fail(2, (turn.err || '').trim() || '内层助手配置错误（退出码 2）');
@@ -287,51 +300,66 @@ async function main() {
   console.log(text);
 
   fs.mkdirSync(out, { recursive: true });
-  // 历史只存本轮 message（不存整个 prompt，避免历史包裹嵌套并把 #R 头挤掉）
+  // 历史只存本轮 message（不存整个 prompt）；默认只用 last 摘要，--full-history 才回放 exchanges
   const saved = exchanges
     .concat([{ user: message.slice(-HISTORY_ITEM_MAX), assistant: text.slice(-HISTORY_ITEM_MAX) }])
     .slice(-HISTORY_MAX_EXCHANGES);
-  fs.writeFileSync(sessFile, JSON.stringify({ thread_id: threadId, type: o.type, r_type: rtype, task: o.task, updated: new Date().toISOString(), exchanges: saved }, null, 2) + '\n');
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   fs.writeFileSync(path.join(out, `pm-reply-${stamp}.md`), `<!-- thread ${threadId} -->\n${text}\n`);
+
+  let decisionObj = null;
   const blocks = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
-  if (!blocks.length) { console.error('[pm-ask] 回复里没有 JSON 决策块，原文已存 .md'); return; }
-  try {
-    let decision = JSON.parse(blocks[blocks.length - 1][1]);
-    if (Array.isArray(decision)) {
-      decision = { tasks: decision };
-      console.error('[pm-ask] 回复末尾是旧版 tasks 数组，已按 {"tasks": [...]} 落盘；缺 directive——不要执行任何 actions');
-    } else if (decision === null || typeof decision !== 'object') {
-      decision = {};
-      console.error('[pm-ask] 回复末尾的 JSON 不是对象，已忽略；缺 directive——不要执行任何 actions');
-    } else if (!decision.directive) {
-      console.error('[pm-ask] 回复缺 directive——不要执行任何 actions，按文本说明或等 PM 对象格式');
-    }
-
-    // head_sha 校验：允许 ≥7 位前缀（PM 可能只给短 SHA），结果写进 json 供 agent 判断
-    const localHead = git(['rev-parse', 'HEAD'], projectRoot);
-    let headShaMatch = null;
-    const want = String(decision.head_sha || '').trim().toLowerCase();
-    if (want) {
-      const ok = want.length >= 7 && localHead && (localHead.startsWith(want) || want.startsWith(localHead));
-      headShaMatch = !!ok;
-      if (!ok) {
-        console.error(
-          `[pm-ask] !! head_sha 与本地 HEAD 不吻合：授权 ${want.slice(0, 12)}…，当前 ${(localHead || '(非 git)').slice(0, 12)}… —— 不要执行任何 actions，按 #R-BLOCKED 回报`
-        );
+  if (!blocks.length) {
+    console.error('[pm-ask] 回复里没有 JSON 决策块，原文已存 .md');
+  } else {
+    try {
+      let decision = JSON.parse(blocks[blocks.length - 1][1]);
+      if (Array.isArray(decision)) {
+        decision = { tasks: decision };
+        console.error('[pm-ask] 回复末尾是旧版 tasks 数组，已按 {"tasks": [...]} 落盘；缺 directive——不要执行任何 actions');
+      } else if (decision === null || typeof decision !== 'object') {
+        decision = {};
+        console.error('[pm-ask] 回复末尾的 JSON 不是对象，已忽略；缺 directive——不要执行任何 actions');
+      } else if (!decision.directive) {
+        console.error('[pm-ask] 回复缺 directive——不要执行任何 actions，按文本说明或等 PM 对象格式');
       }
-    }
 
-    const jp = path.join(out, `pm-reply-${stamp}.json`);
-    fs.writeFileSync(jp, JSON.stringify({ thread: threadId, task: o.task, type: o.type, r_type: rtype, ...decision, head_sha_match: headShaMatch }, null, 2) + '\n');
-    const acts = Array.isArray(decision.actions) ? decision.actions.map((a) => a && a.do).filter(Boolean) : [];
-    console.error(
-      `[pm-ask] 决策 decision=${decision.decision || '?'} directive=${decision.directive || '?'} ` +
-      `head_sha=${want ? want.slice(0, 7) : '(空)'} match=${headShaMatch === null ? 'n/a' : headShaMatch} ` +
-      `report=${decision.report || '?'} actions=${acts.length ? acts.join(',') : '无'}，已写入 ${jp}`
-    );
-  } catch { console.error('[pm-ask] JSON 决策块解析失败，原文已存 .md'); }
+      // head_sha 校验：允许 ≥7 位前缀（PM 可能只给短 SHA），结果写进 json 供 agent 判断
+      const localHead = git(['rev-parse', 'HEAD'], projectRoot);
+      let headShaMatch = null;
+      const want = String(decision.head_sha || '').trim().toLowerCase();
+      if (want) {
+        const ok = want.length >= 7 && localHead && (localHead.startsWith(want) || want.startsWith(localHead));
+        headShaMatch = !!ok;
+        if (!ok) {
+          console.error(
+            `[pm-ask] !! head_sha 与本地 HEAD 不吻合：授权 ${want.slice(0, 12)}…，当前 ${(localHead || '(非 git)').slice(0, 12)}… —— 不要执行任何 actions，按 #R-BLOCKED 回报`
+          );
+        }
+      }
+
+      const jp = path.join(out, `pm-reply-${stamp}.json`);
+      fs.writeFileSync(jp, JSON.stringify({ thread: threadId, task: o.task, type: o.type, r_type: rtype, ...decision, head_sha_match: headShaMatch }, null, 2) + '\n');
+      const acts = Array.isArray(decision.actions) ? decision.actions.map((a) => a && a.do).filter(Boolean) : [];
+      console.error(
+        `[pm-ask] 决策 decision=${decision.decision || '?'} directive=${decision.directive || '?'} ` +
+        `head_sha=${want ? want.slice(0, 7) : '(空)'} match=${headShaMatch === null ? 'n/a' : headShaMatch} ` +
+        `report=${decision.report || '?'} actions=${acts.length ? acts.join(',') : '无'}，已写入 ${jp}`
+      );
+      decisionObj = decision;
+    } catch { console.error('[pm-ask] JSON 决策块解析失败，原文已存 .md'); }
+  }
+
+  const last = {
+    r_type: rtype,
+    thread_id: threadId,
+    decision: decisionObj ? decisionObj.decision || null : null,
+    directive: decisionObj ? decisionObj.directive || null : null,
+    head_sha: decisionObj ? String(decisionObj.head_sha || '').trim() || null : null,
+    updated: new Date().toISOString(),
+  };
+  fs.writeFileSync(sessFile, JSON.stringify({ thread_id: threadId, type: o.type, r_type: rtype, task: o.task, updated: last.updated, exchanges: saved, last }, null, 2) + '\n');
 }
 
 if (require.main === module) main().catch((e) => fail(1, e.stack || String(e)));
