@@ -210,7 +210,7 @@ pm-ask/                             可选配套技能，给执行者用
     └── notion_direct.py            直连 Notion 客户端（curl_cffi Chrome 指纹）
 
 tests/selftest.cjs                  脚本自测（node tests/selftest.cjs，31 项）
-tests/pm-ask.test.cjs               pm-ask 离线自测（桩替身助手，需本机 git/python，node tests/pm-ask.test.cjs，41 项）
+tests/pm-ask.test.cjs               pm-ask 离线自测（桩替身助手，需本机 git/python，node tests/pm-ask.test.cjs，47 项）
 ```
 
 ## 变更（v5，pm-ask 协议 v2）
@@ -221,7 +221,10 @@ tests/pm-ask.test.cjs               pm-ask 离线自测（桩替身助手，需�
 - 回复以末尾 JSON 决策块为准（`decision` / `directive` / `head_sha` / `actions` / `report` / `tasks`）；`actions` 为封闭词表，`head_sha` 与当前 HEAD 不吻合不执行；允许的 git 操作（rebase、`merge_pr` 等）以 actions 白名单为界。
 - 续聊历史改为只存本轮 message（不再存整个 prompt，避免历史包裹嵌套与 `#R` 头被截断）。
 - 单条消息上限 10000 → 16000 字符。
-- 自测扩到 41 项（需要本机 git 与 python）。
+- `head_sha` 由脚本比对本地 HEAD（允许 ≥7 位前缀），结果写进 `pm-reply-*.json` 的 `head_sha_match`；不吻合打印醒目警告，agent 不得执行 actions。
+- 旧版 `tasks` 数组回复按 `{"tasks": [...]}` 落盘并提示「缺 directive」，不执行任何 actions（PM 后续统一对象格式）。
+- `ready` / `check` 前自动 `git fetch origin main`（`PM_ASK_NO_FETCH=1` 可关），消息里带「基线状态」行（已刷新 / 未刷新及原因）。
+- 自测扩到 47 项（需要本机 git 与 python）。
 
 ## 变更（v4，pm-ask 直连版）
 

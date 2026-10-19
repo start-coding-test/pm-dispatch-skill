@@ -11,6 +11,9 @@
 //   #R-<TYPE> 卡=<卡号> 分支=<branch> HEAD=<40位SHA> 基线main=<7位SHA> 时间=<ISO8601>
 //
 // 回复: 终端打印 PM 文本；末尾 JSON 决策块落到 work/<卡号>/pm-reply-*.json（协议 3.1 形状）。
+//   脚本用本地 git 比对 head_sha（允许 ≥7 位前缀）并写 head_sha_match；
+//   旧版 tasks 数组回复按 {"tasks": [...]} 落盘并提示缺 directive。
+// ready / check 前自动 git fetch origin main（PM_ASK_NO_FETCH=1 可关），消息里带「基线状态」一行。
 // 用法:
 //   node pm-ask.cjs plan    --dispatch "项目绝对路径/.dispatch/功能名" --task T03 --msg-file 计划.md
 //   node pm-ask.cjs ready   --dispatch "..." --task T03 --msg-file 证据包.md        # merge 同义
@@ -18,7 +21,7 @@
 // 可选: --timeout 分钟（默认 15）；--new 强制新开会话；--base 基线（默认 origin/main → main → master）
 //
 // 读取: 环境变量 NOTION_TOKEN_V2（必需）、NOTION_PM_MODEL（可选，默认 claude-sonnet5.5）、
-//       PM_ASK_PYTHON（可选，默认 python，指向 python.exe）；
+//       PM_ASK_PYTHON（可选，默认 python，指向 python.exe）、PM_ASK_NO_FETCH（可选，=1 跳过 git fetch）；
 //       <dispatch>/cloud-pm.json: { "project": "项目名", "project_page": "Notion 项目背景页链接" }
 //   自动附带：卡片 cards/<卡号>*.md、results/<卡号>.md（BLOCKED 除外）、ledger.md 本卡那一行、
 //   只读 git 上下文（分支/基线/领先落后/diff --stat/未提交）。
@@ -104,6 +107,26 @@ function splitProtocolBody(note) {
     return { declared: m[1], body: trimmed.slice(m[0].length).trim() };
   }
   return { declared: null, body: trimmed };
+}
+
+// ready / check 前刷新 origin/main，避免基线读到过期值；返回给消息的「基线状态」一行
+function refreshBaseline(rtype, cwd) {
+  if (!['READY', 'CHECK'].includes(rtype)) return '';
+  if (['1', 'true', 'yes'].includes(String(process.env.PM_ASK_NO_FETCH || '').toLowerCase())) {
+    return '基线状态：未刷新（PM_ASK_NO_FETCH=1），origin/main 可能过时';
+  }
+  if (!git(['remote', 'get-url', 'origin'], cwd)) {
+    return '基线状态：未刷新（无 origin 远端），基线取本地 main/master';
+  }
+  const r = spawnSync('git', ['fetch', 'origin', 'main', '--quiet'], {
+    cwd, encoding: 'utf8', timeout: 15000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  });
+  if (r.status === 0) {
+    const short = git(['rev-parse', '--short=7', 'origin/main'], cwd) || '?';
+    return `基线状态：origin/main 已刷新（${short}）`;
+  }
+  const why = r.error && r.error.code === 'ETIMEDOUT' ? 'fetch 超时（15s）' : `fetch 退出码 ${r.status === null ? 'null' : r.status}`;
+  return `基线状态：未刷新（${why}），origin/main 可能过时——按 #R 头里的基线自查`;
 }
 
 function buildProtocolHeader(rtype, task, cwd, base) {
@@ -218,6 +241,7 @@ async function main() {
   if (declared) console.error('[pm-ask] 已丢弃正文自带的 #R 头，改用本地 git 实测值重生成');
 
   const result = rtype === 'BLOCKED' ? '' : readIf(path.join(dir, 'results', `${o.task}.md`), 3000);
+  const baselineNote = refreshBaseline(rtype, projectRoot);
   const g = gitContext(projectRoot, o.base);
   const rhead = buildProtocolHeader(rtype, o.task, projectRoot, o.base);
 
@@ -225,6 +249,7 @@ async function main() {
     rhead,
     body || '',
     ledgerRow && `台账行：${ledgerRow}`,
+    baselineNote && baselineNote,
     g && `git：分支 ${g.branch}，基线 ${g.base}${g.ahead !== undefined ? `（领先 ${g.ahead} / 落后 ${g.behind}）` : ''}，最新 ${g.head}`,
     g && g.stat && `改动统计：\n${g.stat}`,
     g && g.status && `工作树未提交：\n${g.status}`,
@@ -273,14 +298,38 @@ async function main() {
   const blocks = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
   if (!blocks.length) { console.error('[pm-ask] 回复里没有 JSON 决策块，原文已存 .md'); return; }
   try {
-    const decision = JSON.parse(blocks[blocks.length - 1][1]);
+    let decision = JSON.parse(blocks[blocks.length - 1][1]);
+    if (Array.isArray(decision)) {
+      decision = { tasks: decision };
+      console.error('[pm-ask] 回复末尾是旧版 tasks 数组，已按 {"tasks": [...]} 落盘；缺 directive——不要执行任何 actions');
+    } else if (decision === null || typeof decision !== 'object') {
+      decision = {};
+      console.error('[pm-ask] 回复末尾的 JSON 不是对象，已忽略；缺 directive——不要执行任何 actions');
+    } else if (!decision.directive) {
+      console.error('[pm-ask] 回复缺 directive——不要执行任何 actions，按文本说明或等 PM 对象格式');
+    }
+
+    // head_sha 校验：允许 ≥7 位前缀（PM 可能只给短 SHA），结果写进 json 供 agent 判断
+    const localHead = git(['rev-parse', 'HEAD'], projectRoot);
+    let headShaMatch = null;
+    const want = String(decision.head_sha || '').trim().toLowerCase();
+    if (want) {
+      const ok = want.length >= 7 && localHead && (localHead.startsWith(want) || want.startsWith(localHead));
+      headShaMatch = !!ok;
+      if (!ok) {
+        console.error(
+          `[pm-ask] !! head_sha 与本地 HEAD 不吻合：授权 ${want.slice(0, 12)}…，当前 ${(localHead || '(非 git)').slice(0, 12)}… —— 不要执行任何 actions，按 #R-BLOCKED 回报`
+        );
+      }
+    }
+
     const jp = path.join(out, `pm-reply-${stamp}.json`);
-    fs.writeFileSync(jp, JSON.stringify({ thread: threadId, task: o.task, type: o.type, r_type: rtype, ...decision }, null, 2) + '\n');
+    fs.writeFileSync(jp, JSON.stringify({ thread: threadId, task: o.task, type: o.type, r_type: rtype, ...decision, head_sha_match: headShaMatch }, null, 2) + '\n');
     const acts = Array.isArray(decision.actions) ? decision.actions.map((a) => a && a.do).filter(Boolean) : [];
     console.error(
       `[pm-ask] 决策 decision=${decision.decision || '?'} directive=${decision.directive || '?'} ` +
-      `head_sha=${(decision.head_sha || '').slice(0, 7) || '(空)'} report=${decision.report || '?'} ` +
-      `actions=${acts.length ? acts.join(',') : '无'}，已写入 ${jp}`
+      `head_sha=${want ? want.slice(0, 7) : '(空)'} match=${headShaMatch === null ? 'n/a' : headShaMatch} ` +
+      `report=${decision.report || '?'} actions=${acts.length ? acts.join(',') : '无'}，已写入 ${jp}`
     );
   } catch { console.error('[pm-ask] JSON 决策块解析失败，原文已存 .md'); }
 }

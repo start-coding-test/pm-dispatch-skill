@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
-// pm-ask.cjs 的离线自测：在临时技能目录里放一个「桩替身」pm-ask-turn.py 顶替直连网络，
-// 逐项断言协议 v2 的 #R 头、子命令映射、按卡续聊、决策块与落盘。
-// 需要本机有 git（算 #R 头）与 python（跑内层助手）；缺任一则跳过对应部分。
+// pm-ask.cjs 的离线自测：桩替身 pm-ask-turn.py 顶替直连网络，验证协议 v2 的
+// #R 头、子命令映射、head_sha 校验、旧格式兼容、基线刷新提示、按卡续聊与落盘。
+// 需要本机有 git（算 #R 头 / head_sha / fetch）与 python（跑内层助手）；缺任一则跳过对应部分。
 // 用法: node tests/pm-ask.test.cjs      退出码 0 = 全过
 
 const fs = require('fs');
@@ -26,6 +26,11 @@ const skipped = (name) => { skip++; console.log(`SKIP ${name}`); };
 const readLog = () => { try { return fs.readFileSync(LOG, 'utf8'); } catch { return ''; } };
 const clearLog = () => { fs.rmSync(LOG, { force: true }); };
 const sessFile = (t) => path.join(D, 'work', t, 'pm-session.json');
+const latestReplyJson = (t) => {
+  const w = path.join(D, 'work', t);
+  const f = fs.readdirSync(w).filter((x) => x.startsWith('pm-reply-') && x.endsWith('.json')).sort().pop();
+  return f ? JSON.parse(fs.readFileSync(path.join(w, f), 'utf8')) : {};
+};
 const HEADER_RE = /^#R-([A-Z]+) 卡=(\S+) 分支=(\S+) HEAD=([0-9a-f]{40}) 基线main=([0-9a-f]{7}) 时间=\S+/;
 // 续聊时 prompt 以 <conversation_history> 开头；取「本轮」那一段再匹配 #R 头
 const latestOf = (log) => {
@@ -36,7 +41,8 @@ const latestOf = (log) => {
 const headerOf = (log) => HEADER_RE.exec(latestOf(log));
 
 // ---------- 桩替身：读 stdin（prompt）落盘 → 按 STUB_MODE 回应 ----------
-// 「第 N 轮」由 prompt 里有没有 <conversation_history> 决定，用来断言续聊真的注入了历史。
+// 「第 N 轮」由 prompt 里有没有 <conversation_history> 决定；STUB_HEAD_SHA 注入 head_sha；
+// STUB_MODE=array 模拟旧版 tasks 数组回复。
 const STUB = `# -*- coding: utf-8 -*-
 import os, sys
 sys.stdin.reconfigure(encoding="utf-8")
@@ -55,8 +61,13 @@ if mode == "exit1":
     print("[pm-ask-turn] 上游错误: HTTP 401 UserValidationError", file=sys.stderr)
     sys.exit(1)
 n = 2 if "<conversation_history>" in prompt else 1
+sha = os.environ.get("STUB_HEAD_SHA", "")
+if mode == "array":
+    payload = '[{"id":"A05","goal":"stub"}]'
+else:
+    payload = '{"decision":"fix","directive":"FIX","head_sha":"%s","actions":[{"do":"run_gates","cmds":["npm test"]}],"report":"R-CHECK","tasks":[],"reason":"第%d轮"}' % (sha, n)
 print("[pm-ask-turn] thread_id=${STUB_THREAD} hist=%s len=%d" % (n == 2, len(prompt)), file=sys.stderr)
-print('第%d轮建议：先修 schema 再重跑。\\n\\n\`\`\`json\\n{"decision":"fix","directive":"FIX","head_sha":"","actions":[{"do":"run_gates","cmds":["npm test"]}],"report":"R-CHECK","tasks":[],"reason":"第%d轮"}\\n\`\`\`' % (n, n))
+print('第%d轮建议：先修 schema 再重跑。\\n\\n\`\`\`json\\n%s\\n\`\`\`' % (n, payload))
 `;
 
 function run(args, env = {}) {
@@ -97,7 +108,7 @@ function run(args, env = {}) {
   r = await run(['blocked', ...base, '--msg', 'x'], { NOTION_TOKEN_V2: '' });
   check('缺令牌 → 退出码 2', r.rc === 2 && /NOTION_TOKEN_V2/.test(r.out), r.out);
 
-  // ---------- 夹具 git 仓库（#R 头需要 40 位 HEAD 与基线） ----------
+  // ---------- 夹具 git 仓库（#R 头 / head_sha / fetch 需要） ----------
   const hasGit = spawnSync('git', ['--version'], { stdio: 'ignore' }).status === 0;
   if (hasGit) {
     const g = (args) => spawnSync('git', ['-C', ROOT, ...args], { encoding: 'utf8' });
@@ -105,18 +116,17 @@ function run(args, env = {}) {
     fs.writeFileSync(path.join(ROOT, 'repo.txt'), 'fixture\n');
     g(['add', 'repo.txt']);
     g(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init']);
+    g(['remote', 'add', 'origin', ROOT]); // 以自身当远端，供 ready/check 的 fetch 用
+    g(['fetch', '-q', 'origin', 'main']);
+    r = await run(['blocked', ...base, '--msg', 'x'], { PM_ASK_PYTHON: 'definitely_not_exist_cmd' });
+    check('python 不存在 → 退出码 2 且报启动失败', r.rc === 2 && /python 启动失败/.test(r.out), r.out);
   } else {
     skipped('git 相关（本机没有 git）');
   }
 
-  if (hasGit) {
-    r = await run(['blocked', ...base, '--msg', 'x'], { PM_ASK_PYTHON: 'definitely_not_exist_cmd' });
-    check('python 不存在 → 退出码 2 且报启动失败', r.rc === 2 && /python 启动失败/.test(r.out), r.out);
-  }
-
   const hasPython = spawnSync(PY, ['-c', 'pass'], { stdio: 'ignore' }).status === 0;
   if (!hasGit || !hasPython) {
-    for (const name of ['首次呼叫', '按卡续聊', '--new 重置', '跨卡隔离', '子命令映射', 'review 过渡', '助手失败路径']) {
+    for (const name of ['首次呼叫', '按卡续聊', '--new 重置', '跨卡隔离', '子命令映射', 'review 过渡', 'head_sha 校验', '旧格式兼容', '基线刷新', '助手失败路径']) {
       skipped(name + '（缺 ' + (!hasGit ? 'git' : 'python') + '）');
     }
     fs.rmSync(ROOT, { recursive: true, force: true });
@@ -124,7 +134,7 @@ function run(args, env = {}) {
     process.exit(fail ? 1 : 0);
   }
 
-  // ---------- 首次呼叫（merge = ready 别名）：协议头与证据组装 ----------
+  // ---------- 首次呼叫（merge = ready 别名）：协议头、fetch 与证据组装 ----------
   clearLog();
   r = await run(['merge', ...base, '--msg', '自测全绿']);
   check('首次呼叫 → 退出码 0', r.rc === 0, r.out);
@@ -133,6 +143,7 @@ function run(args, env = {}) {
   const h1 = headerOf(log);
   check('首行是协议头 #R-READY', !!h1 && h1[1] === 'READY' && h1[2] === 'T03' && h1[3] === 'main', log.slice(0, 160));
   check('正文在协议头之后', log.indexOf('自测全绿') > (h1 ? h1.index + h1[0].length : 0));
+  check('ready 前自动 fetch：基线状态已刷新', log.includes('基线状态：origin/main 已刷新'), log.slice(0, 400));
   check('带本卡台账行且不串 T30', log.includes('| T03 | schema 单测') && !log.includes('T30'));
   check('ready 附结果文件', log.includes('**状态**: DONE'));
   check('卡片与背景页随附', log.includes('卡片正文') && log.includes('notion.so/demo'));
@@ -147,6 +158,7 @@ function run(args, env = {}) {
     dec.decision === 'fix' && dec.directive === 'FIX' && dec.r_type === 'READY' &&
     Array.isArray(dec.actions) && dec.actions[0].do === 'run_gates' && dec.task === 'T03' && dec.thread === STUB_THREAD,
     JSON.stringify(dec));
+  check('未给 head_sha → head_sha_match=null', dec.head_sha_match === null && /match=n\/a/.test(r.out), r.out);
   check('终端打印决策摘要含 directive/actions', /directive=FIX/.test(r.out) && /actions=run_gates/.test(r.out), r.out);
   const sess1 = JSON.parse(fs.readFileSync(sessFile('T03'), 'utf8'));
   check('会话文件存 thread_id、#R 类型与 1 轮历史',
@@ -200,6 +212,29 @@ function run(args, env = {}) {
   r = await run(['plan', ...base, '--msg', '#R-CHECK 卡=T03 分支=x HEAD=y 基线main=z 时间=t\n计划正文']);
   const hMis = headerOf(readLog());
   check('子命令与正文类型不一致 → 以子命令为准并警告', r.rc === 0 && !!hMis && hMis[1] === 'PLAN' && /不一致/.test(r.out), r.out);
+
+  // ---------- head_sha 校验（≥7 位前缀）与旧格式兼容 ----------
+  const localShort = spawnSync('git', ['-C', ROOT, 'rev-parse', '--short=7', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  clearLog();
+  r = await run(['ready', ...base, '--msg', 'x'], { STUB_HEAD_SHA: localShort });
+  let cur = latestReplyJson('T03');
+  check('head_sha 用 7 位前缀吻合 → head_sha_match=true', r.rc === 0 && cur.head_sha_match === true && /match=true/.test(r.out), r.out);
+
+  clearLog();
+  r = await run(['ready', ...base, '--msg', 'x'], { STUB_HEAD_SHA: 'deadbeef' });
+  cur = latestReplyJson('T03');
+  check('head_sha 不吻合 → head_sha_match=false 且醒目警告', r.rc === 0 && cur.head_sha_match === false && /不吻合/.test(r.out) && /不要执行任何 actions/.test(r.out), r.out);
+
+  clearLog();
+  r = await run(['check', ...base, '--msg', 'x'], { STUB_MODE: 'array' });
+  cur = latestReplyJson('T03');
+  check('数组型回复 → 按 {tasks} 落盘、无 directive、head_sha_match=null',
+    r.rc === 0 && Array.isArray(cur.tasks) && cur.directive === undefined && cur.head_sha_match === null &&
+    /旧版 tasks 数组/.test(r.out) && /缺 directive/.test(r.out), r.out);
+
+  clearLog();
+  r = await run(['ready', ...base, '--msg', 'x'], { PM_ASK_NO_FETCH: '1' });
+  check('PM_ASK_NO_FETCH=1 → 基线状态标注未刷新', r.rc === 0 && readLog().includes('未刷新（PM_ASK_NO_FETCH=1）'), readLog().slice(0, 300));
 
   // ---------- 内层助手失败路径 ----------
   r = await run(['blocked', ...base, '--msg', 'x'], { STUB_MODE: 'exit1' });

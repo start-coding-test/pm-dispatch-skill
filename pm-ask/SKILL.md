@@ -45,6 +45,7 @@ node "$P/scripts/pm-ask.cjs" blocked --dispatch "…" --task T03 --msg "卡在�
 - 过渡期别名 `review`：正文第一行必须写 `#R-<类型>`，脚本据此路由；新代码一律用正式子命令。
 - **一次说全**：每条 `#R-*` 都要把 PM 读不到的证据（命令原文、汇总行原文、退出码、run 号、完整 SHA）一次给全。缺项时 PM 只回一次 `#D-NEED` 列全，补齐后不再来回。
 - 同一张卡第二次呼叫会续用上一次的上下文（`work/<卡号>/pm-session.json` 重放最近 2 轮）；`--new` 强制重开。
+- `ready` / `check` 运行前会自动 `git fetch origin main`（环境变量 `PM_ASK_NO_FETCH=1` 可关）；消息里会带一行「基线状态」，写明已刷新或未刷新（无 origin、超时、失败）。未刷新时基线可能过时，按 `#R` 头里的值自查。
 
 ## 收到回复后（协议 §3）
 
@@ -63,7 +64,9 @@ node "$P/scripts/pm-ask.cjs" blocked --dispatch "…" --task T03 --msg "卡在�
 | `NEED` | 把列出的一次性缺项全部补齐，再发对应 `#R-*` |
 | `ESCALATE` | 触及红线：记 `BLOCKED` 停卡 |
 
-`actions` 是**封闭词表**（协议 §3.1），只执行列出的动作；且 `head_sha` 必须等于当前 `git rev-parse HEAD`，不吻合 → 不执行，回 `#R-BLOCKED`。词表：
+`actions` 是**封闭词表**（协议 §3.1），只执行列出的动作。脚本已把 json 里的 `head_sha` 与本地 HEAD 比对（允许 ≥7 位前缀），结果写进 `pm-reply-*.json` 的 `head_sha_match`：为 `false` 时不要执行任何 actions，回 `#R-BLOCKED`；为 `null` 表示 PM 未授权具体 SHA。
+
+回复末尾若是旧版 `tasks` 数组，脚本按 `{"tasks": [...]}` 落盘并提示「缺 directive」——此时不要执行任何 actions，按文本说明处理或等 PM 的对象格式。词表：
 
 - `edit`：只改 `paths` 列出的文件（卡片白名单内）
 - `run_gates`：跑 `cmds` 里的离线门禁
